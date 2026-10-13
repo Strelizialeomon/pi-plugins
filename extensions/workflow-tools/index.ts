@@ -5,7 +5,7 @@
  * 判定规则、状态机、投递策略都在各自的模块里，单测不需要起 Pi。
  */
 
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionToolContext } from "@earendil-works/pi-coding-agent";
@@ -16,9 +16,11 @@ import { renderTaskCall, renderTaskResult } from "./renderers.ts";
 import {
 	applyChainStep,
 	createIsolatedWorktree,
+	describeChildEvent,
 	discoverAgents,
 	isFailedChild,
 	needsProjectTrust,
+	oneLine,
 	releaseWorktree,
 	startChildPi,
 	type AgentDefinition,
@@ -45,6 +47,15 @@ function fail(text: string, details?: unknown) {
 	return { content: [{ type: "text" as const, text }], details, isError: true };
 }
 
+/**
+ * 进度摘要消息。消息头带任务身份，否则多个任务并行时「[N 行合并]」分不清是谁的。
+ * `description` 是工具参数（无长度上限、可含换行），所以它也得压成一行并按上限截断。
+ */
+export function progressMessage(input: { taskId: string; kind: string; description: string; text: string }): string {
+	const header = oneLine(input.description, `任务 ${input.taskId}（${input.kind}）`);
+	return `${header}\n${input.text}`;
+}
+
 export default function (pi: ExtensionAPI) {
 	let runtime: TaskRuntime | undefined;
 	// 界面动作（notify / setStatus）需要 ctx；工具执行期间会刷新它。
@@ -59,9 +70,13 @@ export default function (pi: ExtensionAPI) {
 				{ triggerTurn: true },
 			);
 		},
-		pushProgress({ text }) {
+		pushProgress({ taskId, kind, description, text }) {
 			// 进度不抢回合：不带 triggerTurn，只在当前回合内插入。
-			pi.sendMessage({ customType: "workflow-tools:progress", content: text, display: true });
+			pi.sendMessage({
+				customType: "workflow-tools:progress",
+				content: progressMessage({ taskId, kind, description, text }),
+				display: true,
+			});
 		},
 		notify(message, type) {
 			ui?.notify(message, type);
@@ -389,24 +404,36 @@ export default function (pi: ExtensionAPI) {
 let logDir: string | undefined;
 
 /** 环形缓冲只留最近 200 行，全量落在会话级临时目录里的一个文件。 */
-function openTaskLog(taskId: string): LogSink {
+export function openTaskLog(taskId: string): LogSink {
 	logDir ??= mkdtempSync(join(tmpdir(), "workflow-tools-logs-"));
 	const path = join(logDir, `${taskId}.log`);
+	let fd: number | undefined;
 	try {
-		writeFileSync(path, "");
+		fd = openSync(path, "w");
 	} catch {
 		// 写不了日志不该让任务起不来
 	}
 	return {
 		path,
 		write(line) {
+			if (fd === undefined) return;
 			try {
-				appendFileSync(path, `${line}\n`);
+				// 一行一次 writeSync：比 appendFileSync 每行 open+write+close 少两次系统调用，
+				// 又不攒缓冲——日志的价值就在「进程没了它还在」
+				writeSync(fd, `${line}\n`);
 			} catch {
 				// 同上：日志是旁路
 			}
 		},
-		close() {},
+		close() {
+			if (fd === undefined) return;
+			try {
+				closeSync(fd);
+			} catch {
+				// 关不掉就算了，不该因为关文件把收尾搞挂
+			}
+			fd = undefined;
+		},
 	};
 }
 
@@ -524,6 +551,8 @@ function summarizeForModel(input: {
 export async function runChild(
 	input: {
 		task: RunningTask;
+		/** 事件要经运行时落环形缓冲与日志，所以这里拿的是整个运行时而不是单条环形缓冲。 */
+		tasks: TaskRuntime;
 		agent: AgentDefinition;
 		taskText: string;
 		cwd: string;
@@ -543,9 +572,11 @@ export async function runChild(
 		...(input.signal ? { signal: input.signal } : {}),
 		// 子会话要真的独立：不带用户级扩展 / 命令 / skills / MCP
 		isolate: true,
+		// 事件流先摊成「人扫得动」的行：直接记事件名的话，终态消息的「最后几行」
+		// 和完整日志里全是 message_update / tool_execution_start 这类内部名词。
 		onEvent: (record) => {
-			const event = record as { type?: string };
-			if (typeof event.type === "string") input.task.ring.push(event.type);
+			const line = describeChildEvent(record);
+			if (line !== undefined) input.tasks.record(input.task.id, line);
 		},
 	});
 }
@@ -601,6 +632,7 @@ async function runOne(input: RunContext & { agentName: string; taskText: string 
 	try {
 		child = await runChild({
 			task,
+			tasks: input.tasks,
 			agent,
 			taskText: input.taskText,
 			cwd: input.cwd,
@@ -700,6 +732,7 @@ async function runParallel(input: RunContext & { items: Array<{ agent: string; t
 			}
 			entry.child = await runChild({
 				task,
+				tasks: input.tasks,
 				agent,
 				taskText: item.task,
 				cwd: item.cwd ?? input.cwd,
@@ -782,6 +815,7 @@ async function runChain(input: RunContext & { steps: Array<{ agent: string; task
 			}
 			child = await runChild({
 				task,
+				tasks: input.tasks,
 				agent,
 				taskText: applyChainStep(step.task, previous),
 				cwd: step.cwd ?? input.cwd,

@@ -14,7 +14,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
-import plugin, { resolveDispatch, runChild } from "./index.ts";
+import plugin, { openTaskLog, progressMessage, resolveDispatch, runChild } from "./index.ts";
 import { buildChildArgs, type AgentDefinition } from "./subagent.ts";
 
 // —— 测试替身 ——
@@ -655,6 +655,7 @@ test("runChild 把算好的模型 / 思考档真送进子会话启动参数", as
 	await runChild(
 		{
 			task: { id: "t1", ring: { push: () => {} } } as unknown as Parameters<typeof runChild>[0]["task"],
+			tasks: { record: () => {} } as unknown as Parameters<typeof runChild>[0]["tasks"],
 			agent: agent(),
 			taskText: "干活",
 			cwd: scratchRoot,
@@ -669,6 +670,55 @@ test("runChild 把算好的模型 / 思考档真送进子会话启动参数", as
 	assert.equal(captured?.thinkingLevel, "medium");
 	assert.equal(captured?.task, "干活");
 	assert.equal(captured?.isolate, true, "子会话必须隔离");
+});
+
+test("runChild 把子会话事件经 tasks.record 记成能读的行", async () => {
+	const ctx = makeCtx("json");
+	const recorded: string[] = [];
+	const recordedIds: string[] = [];
+	let emit: ((record: unknown) => void) | undefined;
+	const fakeStart = (async (inputValue: { onEvent?: (record: unknown) => void }) => {
+		emit = inputValue.onEvent;
+		return { process: { signal() {}, exited: Promise.resolve() }, result: Promise.resolve({}) };
+	}) as unknown as Parameters<typeof runChild>[1];
+
+	await runChild(
+		{
+			task: { id: "t1" } as unknown as Parameters<typeof runChild>[0]["task"],
+			tasks: {
+				record: (id: string, line: string) => {
+					recordedIds.push(id);
+					recorded.push(line);
+				},
+			} as unknown as Parameters<typeof runChild>[0]["tasks"],
+			agent: agent(),
+			taskText: "干活",
+			cwd: scratchRoot,
+			params: {},
+			ctx,
+		},
+		fakeStart,
+	);
+
+	// 实测过的坑：事件名直接进缓冲，终态那边「最后几行」和完整日志都是 message_update
+	emit?.({ type: "tool_execution_start", toolName: "bash", args: { command: "ls" } });
+	emit?.({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "x" } });
+	emit?.({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "干完了" }] } });
+
+	assert.deepEqual(recorded, ['→ bash：{"command":"ls"}', "干完了"], "只记有信息量的行，内部事件名不进缓冲");
+	assert.deepEqual(recordedIds, ["t1", "t1"], "行必须落在自己的任务上——记错 id 会让另一个任务的尾部串台");
+});
+
+test("进度消息头带任务身份，且把 description 压成一行、限长", () => {
+	const single = progressMessage({ taskId: "monitor-3", kind: "monitor", description: "长命令 75 秒", text: "[1 行合并]\nbeat 1" });
+	assert.equal(single, "任务 monitor-3（monitor）长命令 75 秒\n[1 行合并]\nbeat 1");
+
+	// description 是工具参数：可能带换行（劈开头）、可能超长（每条摘要都重复灌上下文）
+	const messy = progressMessage({ taskId: "subagent-2", kind: "subagent", description: `第一行\n${"x".repeat(500)}`, text: "[1 行合并]\nline" });
+	const [header, ...rest] = messy.split("\n");
+	assert.ok(header?.startsWith("任务 subagent-2（subagent）第一行"), `实际：${header}`);
+	assert.ok((header?.length ?? 0) <= 200, `头超宽：${header?.length}`);
+	assert.equal(rest.length, 2, "摘要正文两个行不能被头改写");
 });
 
 test("agent 文件里的 model 优先于父会话，且此时不再继承思考档", () => {
@@ -803,4 +853,20 @@ test("session_shutdown 之后新会话拿到全新运行时，照常接活", asy
 		.execute("c", { description: "y", command: "echo y" }, undefined, undefined, ctx);
 	assert.equal(result.isError, undefined, "/reload 之后新会话应能正常起任务");
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+});
+
+test("完整日志真的落盘：写入、关句柄、关后再写不抛错", () => {
+	const log = openTaskLog("audit-log-probe");
+	try {
+		log.write("→ bash：{\"command\":\"ls\"}");
+		log.write("干完了");
+		assert.equal(readFileSync(log.path, "utf8"), "→ bash：{\"command\":\"ls\"}\n干完了\n", "日志内容要真的可读出来");
+
+		log.close();
+		log.write("迟到的一行");
+		assert.equal(readFileSync(log.path, "utf8").includes("迟到"), false, "关句柄后不该再往里写");
+	} finally {
+		log.close();
+		rmSync(log.path, { force: true });
+	}
 });

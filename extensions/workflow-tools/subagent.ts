@@ -312,6 +312,71 @@ function firstTextPart(content: unknown): string | undefined {
 	return undefined;
 }
 
+/** 一行摘要的宽度上限：终态消息只展示最后几行，一行几十字就够。 */
+const CHILD_LINE_MAX = 200;
+/** 折叠空白前先粗切一刀，把正则的工作量封在这里头。 */
+const CHILD_SOURCE_MAX = CHILD_LINE_MAX * 8;
+
+/**
+ * 按 code point 切，别落在代理对中间：切开一个 emoji 会留下孤立高代理，
+ * 写进日志就是 U+FFFD。只在超长行上出现，肉眼很难联想到是截断切歪了。
+ */
+function sliceSafe(text: string, max: number): string {
+	const cut = text.slice(0, max);
+	const last = cut.charCodeAt(cut.length - 1);
+	return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+}
+
+/** 压成一行并按上限截断。`prefix` 也算在宽度里——否则前缀一长，整行照样撑破。 */
+export function oneLine(text: string, prefix = ""): string {
+	const source = text.length > CHILD_SOURCE_MAX ? sliceSafe(text, CHILD_SOURCE_MAX) : text;
+	const collapsed = `${prefix}${source}`.replace(/\s+/g, " ").trim();
+	return collapsed.length > CHILD_LINE_MAX ? `${sliceSafe(collapsed, CHILD_LINE_MAX - 1)}…` : collapsed;
+}
+
+function previewArgs(args: unknown): string | undefined {
+	if (args === undefined || args === null) return undefined;
+	try {
+		// 参数是一整块 JSON，这一步的 stringify 免不了；超大参数就是这一段内存开销，
+		// 后面那刀预切只封正则，封不住它
+		return JSON.stringify(args) || undefined;
+	} catch {
+		// 循环引用之类序列化不了的结构：宁可不带参数，也不把事件处理搞挂
+		return undefined;
+	}
+}
+
+/**
+ * 子会话的事件流里只有少数几种对人有用：它调了什么工具、回了什么话、哪里失败了。
+ * 原样记下来就是一串 `message_update` 这类内部名词——终态消息的「最后几行」
+ * 和完整日志都变成读不了的东西，所以这里先翻译成人能扫的行。
+ */
+export function describeChildEvent(record: unknown): string | undefined {
+	if (typeof record !== "object" || record === null) return undefined;
+	const event = record as { type?: unknown; toolName?: unknown; args?: unknown; isError?: unknown; message?: unknown };
+	if (typeof event.type !== "string") return undefined;
+	const tool = typeof event.toolName === "string" ? event.toolName : "工具";
+
+	if (event.type === "tool_execution_start") {
+		const preview = previewArgs(event.args);
+		// 工具名也要过 oneLine：它同样可能带换行 / 超长，劈开日志行就毁了「一行一个事件」
+		return preview === undefined ? oneLine(tool, "→ ") : oneLine(preview, `→ ${tool}：`);
+	}
+
+	// 工具跑失败是「最后几行」里最该看见的东西
+	if (event.type === "tool_execution_end" && event.isError === true) return oneLine(`${tool} 执行失败`, "× ");
+	if (event.type !== "message_end") return undefined;
+
+	const message = event.message as { role?: unknown; errorMessage?: unknown; content?: unknown } | undefined;
+	if (!message || message.role !== "assistant") return undefined;
+	if (typeof message.errorMessage === "string" && message.errorMessage.trim()) {
+		return oneLine(message.errorMessage, "× ");
+	}
+
+	const text = firstTextPart(message.content);
+	return text?.trim() ? oneLine(text) : undefined;
+}
+
 /**
  * stdout 是 JSONL 流。按 LF 切，残行扣住等下一块——
  * 和 monitor 切行器同一套逻辑，只是这里多一步 JSON.parse。
@@ -330,6 +395,17 @@ export function parseJsonLines(buffer: string): { records: unknown[]; rest: stri
 		}
 	}
 	return { records, rest };
+}
+
+/**
+ * 进程结束时把没带换行的残行也交出去。
+ * 残行往往就是最终 `message_end`——也就是子会话的答复本身，
+ * 只收进 summary 不回调 `onEvent` 的话，环形缓冲与完整日志会静默缺掉最关键那行。
+ */
+export function flushChildTail(buffer: string, emit?: (record: unknown) => void): unknown[] {
+	const tail = parseJsonLines(`${buffer}\n`);
+	for (const record of tail.records) emit?.(record);
+	return tail.records;
 }
 
 /** 子会话是否算失败。 */
@@ -489,8 +565,7 @@ export async function startChildPi(input: {
 
 	const result = new Promise<ChildOutcome>((resolve) => {
 		const settle = (exitCode: number) => {
-			const tail = parseJsonLines(`${buffer}\n`);
-			for (const record of tail.records) records.push(record);
+			for (const record of flushChildTail(buffer, input.onEvent)) records.push(record);
 			resolve({ summary: summarizeChildOutput(records), exitCode, stderr, aborted });
 		};
 		child.on("close", (code) => settle(code ?? 0));

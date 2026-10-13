@@ -9,7 +9,10 @@ import {
 	releaseWorktree,
 	applyChainStep,
 	buildChildArgs,
+	describeChildEvent,
+	flushChildTail,
 	isFailedChild,
+	oneLine,
 	needsProjectTrust,
 	parseAgentFile,
 	parseJsonLines,
@@ -391,4 +394,109 @@ test("失败判定：非零退出、error、aborted 都算失败", () => {
 	assert.equal(isFailedChild({ text: "", stopReason: "error", toolCalls: 0, usage: {} as never }, 0), true);
 	assert.equal(isFailedChild({ text: "", stopReason: "aborted", toolCalls: 0, usage: {} as never }, 0), true);
 	assert.equal(isFailedChild({ text: "", stopReason: "endTurn", toolCalls: 0, usage: {} as never }, 0), false);
+});
+
+// —— 事件翻译：终态尾部和完整日志里只该出现人能读的行 ——
+
+test("工具调用翻译成一行，带工具名和参数预览", () => {
+	assert.equal(
+		describeChildEvent({ type: "tool_execution_start", toolName: "bash", args: { command: "ls -la" } }),
+		'→ bash：{"command":"ls -la"}',
+	);
+});
+
+test("参数超长时截断，没给参数时只留工具名", () => {
+	const long = describeChildEvent({ type: "tool_execution_start", toolName: "write", args: { content: "x".repeat(1000) } });
+	assert.ok(long?.startsWith("→ write："));
+	assert.ok((long?.length ?? 0) <= 200, `行太长：${long?.length}`);
+	assert.ok(long?.endsWith("…"));
+	assert.equal(describeChildEvent({ type: "tool_execution_start", toolName: "read" }), "→ read");
+});
+
+test("序列化不了的参数不把事件处理搞挂", () => {
+	const cyclic: Record<string, unknown> = {};
+	cyclic.self = cyclic;
+	assert.equal(describeChildEvent({ type: "tool_execution_start", toolName: "bash", args: cyclic }), "→ bash");
+});
+
+test("助手回复翻译成单行，换行压成空格", () => {
+	assert.equal(
+		describeChildEvent({
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "text", text: "第一行\n  第二行" }] },
+		}),
+		"第一行 第二行",
+	);
+});
+
+test("工具失败与模型报错都记成 × 行", () => {
+	assert.equal(describeChildEvent({ type: "tool_execution_end", toolName: "bash", isError: true }), "× bash 执行失败");
+	assert.equal(describeChildEvent({ type: "message_end", message: { role: "assistant", errorMessage: "429 限流" } }), "× 429 限流");
+});
+
+test("内部事件名不进缓冲：这些事件一律不翻译", () => {
+	for (const type of ["message_update", "tool_execution_update", "tool_execution_end", "turn_end", "agent_end"]) {
+		assert.equal(describeChildEvent({ type }), undefined, `${type} 不该产出日志行`);
+	}
+	assert.equal(describeChildEvent(null), undefined, "非对象记录要容忍");
+	assert.equal(describeChildEvent("message_update"), undefined, "字符串记录要容忍");
+	assert.equal(describeChildEvent({ type: "message_end", message: { role: "user", content: "提示词" } }), undefined, "用户消息不算子会话产出");
+});
+
+// —— 对抗式审核逮到的边界：截断、工具名、末尾残行 ——
+
+/** 孤立代理 = 一个 emoji 被切成半个；写进日志就是 U+FFFD 乱码。 */
+function hasLoneSurrogate(text: string): boolean {
+	return /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text);
+}
+
+test("上限截断不切歪代理对：第 199 个 code unit 正好落在 emoji 中间", () => {
+	const line = oneLine("🙂".repeat(150));
+	assert.ok(line.length <= 200, `行超宽：${line.length}`);
+	assert.ok(!hasLoneSurrogate(line), "切出了孤立代理");
+	assert.equal(line.indexOf("\uFFFD"), -1, "UTF-8 里会出现替换符");
+});
+
+test("预切那一刀也不切歪代理对（1600 code unit 处正好是 emoji 前半）", () => {
+	const line = oneLine(`${"a".repeat(1599)}🙂${"b".repeat(50)}`);
+	assert.ok(line.length <= 200, `行超宽：${line.length}`);
+	assert.ok(!hasLoneSurrogate(line), "预切切出了孤立代理");
+});
+
+test("emoji 参数走完整链路也不变乱码，且行宽守住", () => {
+	const line = describeChildEvent({
+		type: "message_end",
+		message: { role: "assistant", content: [{ type: "text", text: "🙂".repeat(400) }] },
+	});
+	assert.ok(line);
+	assert.ok(line.length <= 200, `行超宽：${line.length}`);
+	assert.ok(!hasLoneSurrogate(line));
+	assert.equal(line.indexOf("\uFFFD"), -1);
+});
+
+test("工具名同样过 oneLine：换行不劈行、超长不撑破", () => {
+	const line = describeChildEvent({ type: "tool_execution_end", toolName: "bad\nname".repeat(80), isError: true });
+	assert.ok(line);
+	assert.ok(!line.includes("\n"), "日志行必须是一行");
+	assert.ok(line.length <= 200, `行超宽：${line.length}`);
+	assert.ok(line.startsWith("× "));
+});
+
+test("无参数的启动行也不放过工具名", () => {
+	const line = describeChildEvent({ type: "tool_execution_start", toolName: `x\n${"y".repeat(500)}` });
+	assert.ok(line);
+	assert.ok(!line.includes("\n"));
+	assert.ok(line.length <= 200, `行超宽：${line.length}`);
+});
+
+test("进程末尾不带换行的残行也会回调 onEvent —— 否则日志静默缺掉最终答复", () => {
+	const seen: unknown[] = [];
+	const records = flushChildTail('{"type":"message_end","message":{"role":"assistant"}}', (record) => void seen.push(record));
+	assert.equal(records.length, 1, "残行要进 summary");
+	assert.equal(seen.length, 1, "残行也必须回调 onEvent");
+	assert.deepEqual(seen[0], records[0]);
+
+	const empty: unknown[] = [];
+	assert.deepEqual(flushChildTail("", (record) => void empty.push(record)), []);
+	assert.deepEqual(empty, [], "空缓冲不该凭空造事件");
 });

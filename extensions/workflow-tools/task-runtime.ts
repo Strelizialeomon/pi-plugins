@@ -357,8 +357,8 @@ export interface TaskProcess {
 export interface RuntimeSink {
 	/** 终态必推：实现里必须走 `triggerTurn: true`，会话空闲时也要唤醒模型。 */
 	pushTerminal(input: { taskId: string; status: TerminalStatus; text: string }): void;
-	/** 进度摘要。只有 digest 档会调到。 */
-	pushProgress(input: { taskId: string; text: string }): void;
+	/** 进度摘要。只有 digest 档会调到。带 kind / description 是为了让多个任务并行时能认出是谁。 */
+	pushProgress(input: { taskId: string; kind: TaskKind; description: string; text: string }): void;
 	notify(message: string, type?: "info" | "warning" | "error"): void;
 	status(key: string, text: string | undefined): void;
 }
@@ -403,6 +403,12 @@ export interface TaskRuntime {
 		announce?: boolean;
 	}): BeginResult;
 	progress(id: string, line: string): void;
+	/**
+	 * 只落环形缓冲与完整日志，不参与 digest 投递。
+	 * 子会话要把事件流摊成有用的行记进来看，就走这条——
+	 * 走 progress 会让每个事件都进 digest 窗口。
+	 */
+	record(id: string, line: string): void;
 	/** 转入终态；返回是否真的完成了转移。收尾期内的转移只记状态、不再往外推。 */
 	finish(id: string, status: TerminalStatus): boolean;
 	subscribe(id: string): Subscription | undefined;
@@ -550,14 +556,23 @@ export function createTaskRuntime(options: {
 			return { ok: true, task, position: ticket.position, ready: ticket.ready };
 		},
 
-		progress(id, line) {
+		record(id, line) {
 			const task = tasks.get(id);
 			if (!task || shuttingDown) return;
 			task.ring.push(line);
 			// 环形缓冲只留最近 200 行，被挤掉的靠日志文件兜住
 			task.log?.write(line);
+		},
+
+		progress(id, line) {
+			const task = tasks.get(id);
+			if (!task || shuttingDown) return;
+			task.ring.push(line);
+			task.log?.write(line);
 			const digest = task.delivery.progress(line, now());
-			if (digest !== undefined) sink.pushProgress({ taskId: id, text: digest });
+			if (digest !== undefined) {
+				sink.pushProgress({ taskId: id, kind: task.kind, description: task.record.description, text: digest });
+			}
 		},
 
 		finish,

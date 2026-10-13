@@ -236,6 +236,77 @@ test("收到进度行时不越权推上下文（digest 窗口内静默）", () =
 	assert.deepEqual(progress, [], "同一个 30 秒窗口内不该推 —— 每行 now() 只差 1 秒");
 });
 
+test("进度摘要带任务身份：多个任务并行时得认得出是哪条", () => {
+	const progress: Array<{ taskId: string; kind: string; description: string; text: string }> = [];
+	let clock = 0;
+	const runtime = createTaskRuntime({
+		sink: {
+			pushTerminal: () => {},
+			pushProgress: (input) => void progress.push(input),
+			notify: () => {},
+			status: () => {},
+		},
+		now: () => clock,
+		limits: { maxTasks: 8, maxRunning: 4 },
+		sleep: async () => {},
+	});
+
+	const begun = runtime.begin({ kind: "monitor", description: "长命令 75 秒", deliver: "digest" });
+	if (!begun.ok) return;
+
+	runtime.progress(begun.task.id, "第一行");
+	clock = 30_000;
+	runtime.progress(begun.task.id, "第二行");
+
+	assert.equal(progress.length, 1, "跨过 30 秒窗口才推一条");
+	assert.equal(progress[0]?.taskId, begun.task.id);
+	assert.equal(progress[0]?.kind, "monitor");
+	assert.equal(progress[0]?.description, "长命令 75 秒");
+	assert.ok(progress[0]?.text.startsWith("[2 行合并]"), `实际：${progress[0]?.text}`);
+});
+
+test("record 只落环形缓冲与日志，不参与 digest 投递", () => {
+	const lines: string[] = [];
+	const progress: unknown[] = [];
+	let clock = 0;
+	const runtime = createTaskRuntime({
+		sink: {
+			pushTerminal: () => {},
+			pushProgress: (input) => void progress.push(input),
+			notify: () => {},
+			status: () => {},
+		},
+		now: () => clock,
+		limits: { maxTasks: 8, maxRunning: 4 },
+		sleep: async () => {},
+		openLog: () => ({ path: "/tmp/fake.log", write: (line) => void lines.push(line), close: () => {} }),
+	});
+
+	const begun = runtime.begin({ kind: "subagent", description: "子会话", deliver: "digest" });
+	if (!begun.ok) return;
+
+	for (let i = 0; i < 300; i++) {
+		runtime.record(begun.task.id, `→ bash：第 ${i} 次`);
+		// 就算每隔一个窗口记一行，也不该因为它产生摘要
+		clock += 30_000;
+	}
+
+	assert.equal(lines.length, 300, "日志要留全量");
+	assert.equal(lines[299], "→ bash：第 299 次");
+	assert.equal(begun.task.ring.toArray().length, 200, "环形缓冲仍只留最近 200 行");
+	assert.deepEqual(progress, [], "record 是旁路：子会话事件不进 digest 窗口");
+});
+
+test("record 到不存在或已终态的任务上不抛错", () => {
+	const { runtime } = makeRuntime();
+	runtime.record("没有这个任务", "一行");
+
+	const begun = runtime.begin({ kind: "subagent", description: "收工了", deliver: "digest" });
+	if (!begun.ok) return;
+	runtime.finish(begun.task.id, "completed");
+	runtime.record(begun.task.id, "迟到的事件");
+});
+
 // —— 任务登记表：ID / 状态 / 终态幂等 / 订阅回放 ——
 
 test("每个任务拿到唯一 ID，初始为 running", () => {
