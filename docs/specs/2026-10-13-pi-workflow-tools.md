@@ -3,7 +3,8 @@
 - 日期：2026-10-13
 - 项目：`pi-plugins`
 - 类型：方案期 spec
-- 状态：待实施
+- 状态：已实施（PR #3）
+- Issue：#2
 - 现状核对：2026-10-13，读取仓库文件、`git ls-tree`，并运行 `npm run check`、`npm test`
 
 ## 1. 背景
