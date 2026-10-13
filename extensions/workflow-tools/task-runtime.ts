@@ -374,6 +374,19 @@ export interface RunningTask {
 	release(): void;
 	/** 终态是否往外推。前台任务由工具返回值带走结果，置 false。 */
 	announce: boolean;
+	/**
+	 * 取消方事先声明的终态。被信号杀死的进程 `close` 给的是 `code=null`，
+	 * 结果回调会当成正常退出抢先写 `completed`；有了它，谁先到都按声明记。
+	 */
+	intent?: TerminalStatus;
+	log?: LogSink;
+}
+
+/** 完整日志的落点。spec 要求环形缓冲之外还得有全量日志。 */
+export interface LogSink {
+	path: string;
+	write(line: string): void;
+	close(): void;
 }
 
 export type BeginResult =
@@ -395,8 +408,8 @@ export interface TaskRuntime {
 	subscribe(id: string): Subscription | undefined;
 	get(id: string): RunningTask | undefined;
 	attachProcess(id: string, process: TaskProcess): void;
-	/** 取消单个任务：打进程组，并按统一策略升级到 SIGKILL。 */
-	stop(id: string): boolean;
+	/** 取消单个任务：打进程组，并按统一策略升级到 SIGKILL。`intent` 决定记成什么终态。 */
+	stop(id: string, intent?: TerminalStatus): boolean;
 	/** 会话收尾：置位 → 打进程组 → await 真正退出。 */
 	shutdown(): Promise<void>;
 	isShuttingDown(): boolean;
@@ -413,9 +426,14 @@ export function createTaskRuntime(options: {
 	limits: { maxTasks: number; maxRunning: number };
 	/** 测试用：把「等 5 秒」换掉，避免单测真的睡 5 秒。 */
 	sleep?: (ms: number) => Promise<void>;
+	/** 完整日志的落点。不提供就不写日志（单测走这条）。 */
+	openLog?: (taskId: string) => LogSink;
+	/** 收尾时等待进程退出的上限，超过就不再干等。 */
+	exitWaitMs?: number;
 }): TaskRuntime {
 	const { sink, now, limits } = options;
 	const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+	const exitWaitMs = options.exitWaitMs ?? 10_000;
 	const registry = createTaskRegistry({ now });
 	const gate = createConcurrencyGate(limits);
 	const tasks = new Map<string, RunningTask>();
@@ -435,36 +453,75 @@ export function createTaskRuntime(options: {
 		if (!exited) {
 			// 注意：不能拿 `child.killed` 判断——信号送达它就为 true，进程可能还活着。
 			proc.signal("SIGKILL");
-			await proc.exited;
+			// 这一等必须有上限：`exited` 挂的是子进程的 close，而 close 要等所有 stdio 关闭。
+			// 孙进程若逃到别的进程组又攥着管道，没有上限就会把 /reload 永久卡住。
+			await Promise.race([proc.exited, sleep(exitWaitMs)]);
 		}
 		processes.delete(id);
 	}
 
-	function terminalText(task: RunningTask, status: TerminalStatus): string {
+	function terminalText(task: RunningTask, status: TerminalStatus, logPath?: string): string {
 		const tail = task.ring.toArray().slice(-5);
 		const head = `任务 ${task.id}（${task.kind}）${status}：${task.record.description}`;
-		return tail.length > 0 ? `${head}\n最后几行：\n${tail.join("\n")}` : head;
+		const body = tail.length > 0 ? `${head}\n最后几行：\n${tail.join("\n")}` : head;
+		return logPath ? `${body}\n完整日志：${logPath}` : body;
 	}
 
+	const TERMINAL_LABELS: Record<TerminalStatus, string> = {
+		completed: "完成",
+		failed: "失败",
+		stopped: "已停止",
+		expired: "超时",
+	};
+
 	function refreshStatus() {
-		const live = registry.live();
-		sink.status(STATUS_KEY, live > 0 ? `运行中：${live}` : undefined);
+		try {
+			const live = registry.live();
+			if (live === 0) {
+				sink.status(STATUS_KEY, undefined);
+				return;
+			}
+			const latest = [...tasks.values()].at(-1);
+			const tail = latest?.ring.toArray().at(-1);
+			sink.status(STATUS_KEY, `运行中：${live}${tail ? ` · ${truncateLine(tail, 60)}` : ""}`);
+		} catch {
+			// 界面通道抛错不该影响任务状态
+		}
 	}
 
 	function finish(id: string, status: TerminalStatus): boolean {
 		const task = tasks.get(id);
 		if (!task) return false;
-		if (!registry.finish(id, status)) return false;
+
+		// 取消方声明的终态优先：被信号杀死的进程 close 给的是 code=null，
+		// 结果回调会把它当成正常退出、抢先写 completed。
+		const effective = task.intent ?? status;
+		if (!registry.finish(id, effective)) return false;
 
 		task.release();
-		// 收尾期开始后的推送直接丢弃，不写进已被替换的旧会话。
-		if (!shuttingDown && task.announce) {
-			task.delivery.flush();
-			sink.pushTerminal({ taskId: id, status, text: terminalText(task, status) });
+
+		try {
+			task.log?.close();
+			// 收尾期开始后的推送直接丢弃，不写进已被替换的旧会话。
+			if (!shuttingDown && task.announce) {
+				task.delivery.flush();
+				sink.pushTerminal({
+					taskId: id,
+					status: effective,
+					text: terminalText(task, effective, task.log?.path),
+				});
+				sink.notify(
+					`任务${TERMINAL_LABELS[effective]}：${task.record.description}`,
+					effective === "completed" ? "info" : "warning",
+				);
+			}
+		} catch {
+			// 界面通道坏了不该拖住清理
+		} finally {
+			tasks.delete(id);
+			processes.delete(id);
+			refreshStatus();
 		}
-		tasks.delete(id);
-		processes.delete(id);
-		refreshStatus();
 		return true;
 	}
 
@@ -485,6 +542,7 @@ export function createTaskRuntime(options: {
 				controller: new AbortController(),
 				release: ticket.release,
 				announce: announce ?? true,
+				...(options.openLog ? { log: options.openLog(record.id) } : {}),
 			};
 			tasks.set(task.id, task);
 			refreshStatus();
@@ -496,6 +554,8 @@ export function createTaskRuntime(options: {
 			const task = tasks.get(id);
 			if (!task || shuttingDown) return;
 			task.ring.push(line);
+			// 环形缓冲只留最近 200 行，被挤掉的靠日志文件兜住
+			task.log?.write(line);
 			const digest = task.delivery.progress(line, now());
 			if (digest !== undefined) sink.pushProgress({ taskId: id, text: digest });
 		},
@@ -503,13 +563,24 @@ export function createTaskRuntime(options: {
 		finish,
 		subscribe: (id) => registry.subscribe(id),
 		get: (id) => tasks.get(id),
-		attachProcess: (id, process) => void processes.set(id, process),
+		attachProcess(id, process) {
+			const task = tasks.get(id);
+			// 任务已终态、或会话已在收尾时不能只登记：这段窗口里进程早就起来了，
+			// 登记完就再没人管它——它会带着独立进程组活过 Pi 退出。
+			if (!task || shuttingDown) {
+				process.signal("SIGTERM");
+				return;
+			}
+			processes.set(id, process);
+		},
 
-		stop(id) {
+		stop(id, intent: TerminalStatus = "stopped") {
 			const task = tasks.get(id);
 			if (!task) return false;
+			// 先声明意图再 abort：结果回调不管多早到，都会被这个 intent 压住。
+			task.intent = intent;
 			task.controller.abort();
-			void terminate(id).then(() => finish(id, "stopped"));
+			void terminate(id).then(() => finish(id, intent));
 			return true;
 		},
 

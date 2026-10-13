@@ -68,6 +68,14 @@ export function startShellCommand(input: {
 		for (const line of splitter.push(chunk)) input.onLine(line);
 	});
 
+	// stderr 声明成 pipe 就必须有人读：管道缓冲写满 64KB 后，
+	// 命令会卡在写 stderr 上，而日志恰恰是往 stderr 写的居多。
+	const stderrSplitter = new LineSplitter();
+	child.stderr?.setEncoding("utf8");
+	child.stderr?.on("data", (chunk: string) => {
+		for (const line of stderrSplitter.push(chunk)) input.onLine(line);
+	});
+
 	const emitTail = () => {
 		const tail = splitter.flush();
 		if (tail !== undefined) input.onLine(tail);

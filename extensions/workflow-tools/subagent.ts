@@ -163,6 +163,16 @@ export async function discoverAgents(cwd: string, scope: AgentScope | undefined)
 	return [...userAgents, ...projectAgents];
 }
 
+/**
+ * agent 名字来自磁盘上的 frontmatter，是不能信的内容：它会被拼进临时文件路径。
+ * `name: ../../x` 这种能写到临时目录之外，所以这里只放行安全字符。
+ */
+export function safeFileName(name: string): string {
+	const cleaned = name.replace(/[^A-Za-z0-9._-]/g, "_").replace(/\.{2,}/g, "_");
+	const trimmed = cleaned.replace(/^[._-]+/, "");
+	return trimmed || "agent";
+}
+
 /** 链式执行：把上一步的最终文本注入 `{previous}`。没有前序结果时原样留着。 */
 export function applyChainStep(task: string, previous: string | undefined): string {
 	if (previous === undefined) return task;
@@ -200,13 +210,14 @@ export function buildChildArgs(input: {
 	return args;
 }
 
+/** 对齐 Pi 的真实 `Usage`：成本在 `cost.total`，不是一个叫 `costTotal` 的平铺字段。 */
 export interface ChildUsage {
 	input: number;
 	output: number;
 	cacheRead: number;
 	cacheWrite: number;
 	totalTokens: number;
-	costTotal: number;
+	cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
 }
 
 export interface ChildSummary {
@@ -223,7 +234,14 @@ export interface ChildSummary {
  * 认不出来的记录一律忽略——首条可能是会话头，也可能没有。
  */
 export function summarizeChildOutput(records: unknown[]): ChildSummary {
-	const usage: ChildUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, costTotal: 0 };
+	const usage: ChildUsage = {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
 	let text = "";
 	let model: string | undefined;
 	let stopReason: string | undefined;
@@ -234,10 +252,12 @@ export function summarizeChildOutput(records: unknown[]): ChildSummary {
 		if (typeof record !== "object" || record === null) continue;
 		const event = record as { type?: unknown; message?: unknown };
 
-		if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
+		// 每次工具调用 Pi 会先后发 start 与 end 两条，只能数其中一条，否则翻倍
+		if (event.type === "tool_execution_start") {
 			toolCalls += 1;
 			continue;
 		}
+		if (event.type === "tool_execution_end") continue;
 		if (event.type !== "message_end") continue;
 
 		const message = event.message as
@@ -259,7 +279,14 @@ export function summarizeChildOutput(records: unknown[]): ChildSummary {
 			usage.cacheRead += reported.cacheRead ?? 0;
 			usage.cacheWrite += reported.cacheWrite ?? 0;
 			usage.totalTokens += reported.totalTokens ?? 0;
-			usage.costTotal += reported.costTotal ?? 0;
+			const cost = reported.cost;
+			if (cost) {
+				usage.cost.input += cost.input ?? 0;
+				usage.cost.output += cost.output ?? 0;
+				usage.cost.cacheRead += cost.cacheRead ?? 0;
+				usage.cost.cacheWrite += cost.cacheWrite ?? 0;
+				usage.cost.total += cost.total ?? 0;
+			}
 		}
 	}
 
@@ -328,6 +355,58 @@ export function piInvocation(args: string[]): { command: string; args: string[] 
 	return { command: "pi", args };
 }
 
+export interface WorktreeHandle {
+	path: string;
+	/** 建它时的那个仓库，清理要回到这里执行。 */
+	base: string;
+}
+
+async function runGit(args: string[], cwd: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+	return await new Promise((resolve) => {
+		const child = spawn("git", args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+		let stdout = "";
+		let stderr = "";
+		child.stdout?.setEncoding("utf8");
+		child.stdout?.on("data", (chunk: string) => (stdout += chunk));
+		child.stderr?.setEncoding("utf8");
+		child.stderr?.on("data", (chunk: string) => (stderr += chunk));
+		child.on("error", (error) => resolve({ ok: false, stdout, stderr: String(error) }));
+		child.on("close", (code) => resolve({ ok: code === 0, stdout, stderr }));
+	});
+}
+
+/** 为一次子会话开一个独立的 worktree，子会话在里面改东西，不碰主工作区。 */
+export async function createIsolatedWorktree(
+	base: string,
+): Promise<{ ok: true; handle: WorktreeHandle } | { ok: false; error: string }> {
+	const dir = await mkdtemp(join(tmpdir(), "workflow-tools-wt-"));
+	const path = join(dir, "repo");
+
+	const added = await runGit(["worktree", "add", "--detach", path], base);
+	if (!added.ok) {
+		await rm(dir, { recursive: true, force: true });
+		return { ok: false, error: `建 worktree 失败：${added.stderr.trim() || added.stdout.trim()}` };
+	}
+	return { ok: true, handle: { path, base } };
+}
+
+/**
+ * 收工。有未提交改动时**不删**——把路径交回给调用方，
+ * 让人自己决定是留着还是清掉。
+ */
+export async function releaseWorktree(handle: WorktreeHandle): Promise<{ removed: boolean; reason?: string }> {
+	const status = await runGit(["status", "--porcelain"], handle.path);
+	if (!status.ok) return { removed: false, reason: "读不到 worktree 状态，保守起见不删。" };
+	if (status.stdout.trim().length > 0) {
+		return { removed: false, reason: "worktree 里有未提交改动，已保留。" };
+	}
+
+	const removed = await runGit(["worktree", "remove", handle.path], handle.base);
+	if (!removed.ok) return { removed: false, reason: removed.stderr.trim() || "移除 worktree 失败。" };
+	await rm(dirname(handle.path), { recursive: true, force: true });
+	return { removed: true };
+}
+
 export interface ChildOutcome {
 	summary: ChildSummary;
 	exitCode: number;
@@ -359,7 +438,7 @@ export async function startChildPi(input: {
 
 	if (input.agent.systemPrompt.trim()) {
 		promptDir = await mkdtemp(join(tmpdir(), "workflow-tools-"));
-		promptPath = join(promptDir, `${input.agent.name}.md`);
+		promptPath = join(promptDir, `${safeFileName(input.agent.name)}.md`);
 		// 0600：系统提示可能含敏感内容，不给同机其他用户读
 		await writeFile(promptPath, input.agent.systemPrompt, { mode: 0o600 });
 	}

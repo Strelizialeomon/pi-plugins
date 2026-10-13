@@ -152,6 +152,80 @@ test("shutdown 会把还活着的任务全部收成 stopped", async () => {
 	assert.deepEqual(proc.signals, ["SIGTERM"]);
 });
 
+test("announce: false 的任务不推终态 —— 前台结果由工具返回值带走", () => {
+	const { runtime, pushed } = makeRuntime();
+	const begun = runtime.begin({ kind: "subagent", description: "前台跑", deliver: "digest", announce: false });
+	if (!begun.ok) return;
+
+	assert.equal(runtime.finish(begun.task.id, "completed"), true);
+	assert.deepEqual(pushed, [], "前台任务不该再推一条终态，否则模型收到两遍");
+});
+
+test("announce 缺省为 true：后台任务必须推终态", () => {
+	const { runtime, pushed } = makeRuntime();
+	const begun = runtime.begin({ kind: "subagent", description: "后台跑", deliver: "digest" });
+	if (!begun.ok) return;
+
+	runtime.finish(begun.task.id, "completed");
+	assert.equal(pushed.length, 1);
+});
+
+test("被取消的任务：结果回调先到也记成 stopped，不记成 completed", () => {
+	const { runtime, pushed } = makeRuntime();
+	const begun = runtime.begin({ kind: "monitor", description: "倔", deliver: "digest" });
+	if (!begun.ok) return;
+
+	const proc = makeProcess({ exitOnSigterm: false });
+	runtime.attachProcess(begun.task.id, proc.handle);
+
+	runtime.stop(begun.task.id, "stopped");
+	// 模拟「进程 close 给 code=null，结果回调抢先记成正常退出」
+	runtime.finish(begun.task.id, "completed");
+
+	assert.equal(pushed.at(-1)?.status, "stopped");
+});
+
+test("超时同样按 expired 记，不被正常退出覆盖", () => {
+	const { runtime, pushed } = makeRuntime();
+	const begun = runtime.begin({ kind: "monitor", description: "慢", deliver: "digest" });
+	if (!begun.ok) return;
+
+	runtime.stop(begun.task.id, "expired");
+	runtime.finish(begun.task.id, "completed");
+	assert.equal(pushed.at(-1)?.status, "expired");
+});
+
+test("提供 openLog 时，进度行会落到完整日志里（环形缓冲只有 200 行）", () => {
+	const lines: string[] = [];
+	const runtime = createTaskRuntime({
+		sink: { pushTerminal: () => {}, pushProgress: () => {}, notify: () => {}, status: () => {} },
+		now: () => 0,
+		limits: { maxTasks: 8, maxRunning: 4 },
+		sleep: async () => {},
+		openLog: () => ({ path: "/tmp/fake.log", write: (line) => void lines.push(line), close: () => {} }),
+	});
+
+	const begun = runtime.begin({ kind: "monitor", description: "日志", deliver: "terminal" });
+	if (!begun.ok) return;
+	for (let i = 0; i < 300; i++) runtime.progress(begun.task.id, `line ${i}`);
+
+	assert.equal(lines.length, 300, "日志要留全量");
+	assert.equal(lines[299], "line 299");
+});
+
+test("收尾期之后再 attachProcess 的进程会被就地打死，不留孤儿", () => {
+	const { runtime } = makeRuntime();
+	const begun = runtime.begin({ kind: "subagent", description: "在途", deliver: "digest" });
+	if (!begun.ok) return;
+
+	// 模拟 begin 之后、attach 之前会话开始收尾
+	void runtime.shutdown();
+
+	const proc = makeProcess();
+	runtime.attachProcess(begun.task.id, proc.handle);
+	assert.deepEqual(proc.signals, ["SIGTERM"], "逃过收尾窗口的进程必须被就地打死");
+});
+
 test("收到进度行时不越权推上下文（digest 窗口内静默）", () => {
 	const { runtime, progress } = makeRuntime();
 	const begun = runtime.begin({ kind: "monitor", description: "日志", deliver: "digest" });

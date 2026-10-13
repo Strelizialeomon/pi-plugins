@@ -5,6 +5,9 @@
  * 判定规则、状态机、投递策略都在各自的模块里，单测不需要起 Pi。
  */
 
+import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { askQuestions, validateQuestions } from "./question-card.ts";
@@ -12,14 +15,24 @@ import { startShellCommand } from "./monitor.ts";
 import { renderTaskCall, renderTaskResult } from "./renderers.ts";
 import {
 	applyChainStep,
+	createIsolatedWorktree,
 	discoverAgents,
 	isFailedChild,
 	needsProjectTrust,
-	selectAgents,
+	releaseWorktree,
 	startChildPi,
 	type AgentDefinition,
+	type ChildUsage,
+	type WorktreeHandle,
 } from "./subagent.ts";
-import { createTaskRuntime, type RunningTask, type RuntimeSink, type TaskRuntime } from "./task-runtime.ts";
+import {
+	createTaskRuntime,
+	type LogSink,
+	type RunningTask,
+	type RuntimeSink,
+	type TaskRuntime,
+	type TerminalStatus,
+} from "./task-runtime.ts";
 
 const DEFAULT_TIMEOUT_MS = 300_000;
 const MAX_TIMEOUT_MS = 1_800_000;
@@ -64,6 +77,8 @@ export default function (pi: ExtensionAPI) {
 			sink,
 			now: () => Date.now(),
 			limits: { maxTasks: 8, maxRunning: 4 },
+			openLog: (taskId) => openTaskLog(taskId),
+			exitWaitMs: 10_000,
 		});
 		return runtime;
 	}
@@ -101,11 +116,13 @@ export default function (pi: ExtensionAPI) {
 				),
 			}),
 			executionMode: "sequential",
-			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 				const validated = validateQuestions(params);
 				if (!validated.ok) return fail(validated.error, { kind: "invalid_arguments" });
 
-				const result = await askQuestions(ctx, validated.questions);
+				// signal 必须传下去：RPC 侧的 select/input 要靠它落定，
+				// 否则卡片一挂，cardOpen 就永远是 true，之后每次调用都返回 busy。
+				const result = await askQuestions(ctx, validated.questions, signal);
 				return ok(JSON.stringify(result), result);
 			},
 			renderCall(args) {
@@ -139,7 +156,7 @@ export default function (pi: ExtensionAPI) {
 					}),
 				),
 			}),
-			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 				const tasks = rt(ctx);
 				const hasCommand = typeof params.command === "string" && params.command.length > 0;
 				const hasTaskId = typeof params.task_id === "string" && params.task_id.length > 0;
@@ -185,21 +202,19 @@ export default function (pi: ExtensionAPI) {
 				const started = startShellCommand({
 					command,
 					cwd: ctx.cwd,
-					signal: task.controller.signal,
+					signal: combinedSignal(signal, task),
 					onLine: (line) => tasks.progress(task.id, line),
 				});
 				tasks.attachProcess(task.id, started.process);
 
-				const timer =
-					timeoutMs > 0
-						? setTimeout(() => {
-								tasks.get(task.id)?.controller.abort();
-								tasks.finish(task.id, "expired");
-							}, timeoutMs)
-						: undefined;
+				// 超时走和 task_stop 同一条路：打进程组 → 等退出 → 升级 SIGKILL。
+				// 直接 abort + finish 会把进程句柄从注册表摘掉，抗 SIGTERM 的命令
+				// 就变成再也管不着的孤儿。
+				const timer = timeoutMs > 0 ? setTimeout(() => tasks.stop(task.id, "expired"), timeoutMs) : undefined;
 
 				void started.result.then(({ exitCode }) => {
 					if (timer) clearTimeout(timer);
+					// 被 stop 过的任务已带 intent，这里的 completed 会被 intent 压住
 					tasks.finish(task.id, exitCode === 0 ? "completed" : "failed");
 				});
 
@@ -270,38 +285,54 @@ export default function (pi: ExtensionAPI) {
 			}),
 			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 				const tasks = rt(ctx);
-				const cwd = params.cwd ?? ctx.cwd;
-
+				const baseCwd = params.cwd ?? ctx.cwd;
 				const pool = await resolveAgents(ctx, params.agentScope);
 
-				if (Array.isArray(params.chain) && params.chain.length > 0) {
-					return await runChain({ tasks, pool, steps: params.chain, cwd, params, signal, ctx });
-				}
-				if (Array.isArray(params.tasks) && params.tasks.length > 0) {
-					if (params.tasks.length > 8) {
-						return fail(`一次最多 8 个并行任务，收到 ${params.tasks.length} 个。`, {
-							kind: "concurrency_exceeded",
-						});
-					}
-					return await runParallel({ tasks, pool, items: params.tasks, cwd, params, signal, ctx });
+				// 先定模式，才能算出这次真正会用到哪些 agent
+				const isChain = Array.isArray(params.chain) && params.chain.length > 0;
+				const isParallel = Array.isArray(params.tasks) && params.tasks.length > 0;
+				if (isChain && isParallel) {
+					return fail("`tasks` 与 `chain` 只能给一个。", { kind: "invalid_arguments" });
 				}
 
+				const steps = isChain ? (params.chain as Array<{ agent: string; task: string; cwd?: string }>) : [];
+				const items = isParallel ? (params.tasks as Array<{ agent: string; task: string; cwd?: string }>) : [];
+				const names = isChain
+					? steps.map((step) => step.agent)
+					: isParallel
+						? items.map((item) => item.agent)
+						: params.agent
+							? [params.agent]
+							: [];
+
+				if (names.length === 0) {
+					return fail("需要给 `agent` + `task`、`tasks`、或 `chain` 三者之一。", { kind: "invalid_arguments" });
+				}
+				if (isParallel && names.length > 8) {
+					return fail(`一次最多 8 个并行任务，收到 ${names.length} 个。`, { kind: "concurrency_exceeded" });
+				}
+
+				// 信任门对三个模式一视同仁——只在单个模式挡，等于没挡
+				const guard = guardProjectAgent(names, pool, params.confirmProjectAgents, ctx);
+				if (guard) return guard;
+
+				// worktree 隔离：显式要求才建，子会话的改动落在独立工作区里，不碰主工作区
+				let cwd = baseCwd;
+				let worktree: WorktreeHandle | undefined;
+				if (params.isolation === "worktree") {
+					const created = await createIsolatedWorktree(baseCwd);
+					if (!created.ok) return fail(created.error, { kind: "worktree_failed" });
+					worktree = created.handle;
+					cwd = created.handle.path;
+				}
+
+				const shared = { tasks, pool, cwd, params, signal, ctx, worktree };
+				if (isChain) return await runChain({ ...shared, steps });
+				if (isParallel) return await runParallel({ ...shared, items });
 				if (!params.agent || !params.task) {
 					return fail("单个模式需要同时给 `agent` 和 `task`。", { kind: "invalid_arguments" });
 				}
-				const guard = guardProjectAgent([params.agent], pool, params.confirmProjectAgents, ctx);
-				if (guard) return guard;
-
-				return await runOne({
-					tasks,
-					pool,
-					agentName: params.agent,
-					taskText: params.task,
-					cwd,
-					params,
-					signal,
-					ctx,
-				});
+				return await runOne({ ...shared, agentName: params.agent, taskText: params.task });
 			},
 			renderCall(args) {
 				const what = args.chain?.length ? `链式 ${args.chain.length} 步` : args.tasks?.length ? `并行 ${args.tasks.length} 个` : (args.agent ?? "未指定");
@@ -335,7 +366,7 @@ export default function (pi: ExtensionAPI) {
 					);
 				}
 
-				tasks.stop(params.task_id);
+				tasks.stop(params.task_id, "stopped");
 				return ok(JSON.stringify({ taskId: params.task_id, status: "stopping" }), {
 					taskId: params.task_id,
 					status: "stopping",
@@ -352,6 +383,55 @@ export default function (pi: ExtensionAPI) {
 }
 
 // —— 工具实现里的公共部分 ——
+
+let logDir: string | undefined;
+
+/** 环形缓冲只留最近 200 行，全量落在会话级临时目录里的一个文件。 */
+function openTaskLog(taskId: string): LogSink {
+	logDir ??= mkdtempSync(join(tmpdir(), "workflow-tools-logs-"));
+	const path = join(logDir, `${taskId}.log`);
+	try {
+		writeFileSync(path, "");
+	} catch {
+		// 写不了日志不该让任务起不来
+	}
+	return {
+		path,
+		write(line) {
+			try {
+				appendFileSync(path, `${line}\n`);
+			} catch {
+				// 同上：日志是旁路
+			}
+		},
+		close() {},
+	};
+}
+
+/**
+ * 并发排队：超过 4 个在跑的任务要等空槽，不能直接 spawn。
+ * 等的时候任务可能已经被取消，返回 false 表示别再往下走了。
+ */
+async function waitForSlot(task: RunningTask, ready: Promise<void>, signal?: AbortSignal): Promise<boolean> {
+	if (signal?.aborted) return false;
+	await ready;
+	return !task.controller.signal.aborted;
+}
+
+/** 子会话用哪个模型 / 思考档：显式参数 > agent 文件 > 父会话。 */
+function resolveDispatch(
+	agent: AgentDefinition,
+	params: { model?: string; thinking_level?: string },
+	ctx: ExtensionToolContext,
+): { model?: string; thinkingLevel?: string } {
+	const model = params.model ?? agent.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+	// agent 文件指定了模型时，不再继承父会话的思考档——那是给父模型调的
+	const thinkingLevel = params.thinking_level ?? (params.model || agent.model ? undefined : ctx.thinkingLevel);
+	return {
+		...(model ? { model } : {}),
+		...(thinkingLevel ? { thinkingLevel } : {}),
+	};
+}
 
 function normalizeTimeout(value: number | undefined): number {
 	if (value === undefined) return DEFAULT_TIMEOUT_MS;
@@ -403,7 +483,7 @@ function summarizeForModel(input: {
 	model?: string;
 	durationMs: number;
 	toolCalls: number;
-	usage: { totalTokens: number; costTotal: number };
+	usage: ChildUsage;
 	stderr?: string;
 }) {
 	return {
@@ -415,7 +495,8 @@ function summarizeForModel(input: {
 		durationMs: input.durationMs,
 		toolCalls: input.toolCalls,
 		totalTokens: input.usage.totalTokens,
-		costTotal: input.usage.costTotal,
+		// 真实成本挂在 usage.cost.total 上，不是一个平铺字段
+		costTotal: input.usage.cost.total,
 		stderr: input.stderr?.slice(-2000),
 	};
 }
@@ -446,16 +527,31 @@ async function runChild(input: {
 	return started;
 }
 
-async function runOne(input: {
+interface RunContext {
 	tasks: TaskRuntime;
 	pool: AgentDefinition[];
-	agentName: string;
-	taskText: string;
 	cwd: string;
 	params: { run_in_background?: boolean; model?: string; thinking_level?: string };
 	signal?: AbortSignal;
 	ctx: ExtensionToolContext;
-}) {
+	worktree?: WorktreeHandle;
+}
+
+/** 工具信号和任务取消信号要同时生效：只接工具信号的话，`task_stop` 对子 Pi 是条死线。 */
+function combinedSignal(toolSignal: AbortSignal | undefined, task: RunningTask): AbortSignal | undefined {
+	const signals = [toolSignal, task.controller.signal].filter((value): value is AbortSignal => value !== undefined);
+	if (signals.length === 0) return undefined;
+	if (signals.length === 1) return signals[0];
+	return AbortSignal.any(signals);
+}
+
+async function settleWorktree(handle?: WorktreeHandle) {
+	if (!handle) return undefined;
+	const result = await releaseWorktree(handle);
+	return { path: handle.path, removed: result.removed, ...(result.reason ? { reason: result.reason } : {}) };
+}
+
+async function runOne(input: RunContext & { agentName: string; taskText: string }) {
 	const agent = findAgent(input.pool, input.agentName);
 	if (!agent) return missingAgent(input.agentName, input.pool);
 
@@ -471,30 +567,49 @@ async function runOne(input: {
 
 	const task = begun.task;
 	const startedAt = Date.now();
-	const child = await runChild({
-		task,
-		agent,
-		taskText: input.taskText,
-		cwd: input.cwd,
-		...(input.params.model ? { model: input.params.model } : {}),
-		...(input.params.thinking_level ? { thinkingLevel: input.params.thinking_level } : {}),
-		...(input.signal ? { signal: input.signal } : {}),
-	});
+
+	// 排队：第 5 个起的任务要等空槽，不能直接 spawn
+	if (!(await waitForSlot(task, begun.ready, input.signal))) {
+		input.tasks.finish(task.id, "stopped");
+		return fail("任务在排队期间被取消。", { kind: "cancelled" });
+	}
+
+	let child: ChildRun;
+	try {
+		child = await runChild({
+			task,
+			agent,
+			taskText: input.taskText,
+			cwd: input.cwd,
+			...resolveDispatch(agent, input.params, input.ctx),
+			signal: combinedSignal(input.signal, task),
+		});
+	} catch (error) {
+		// 起不来也必须收敛，否则并发槽永久泄漏
+		input.tasks.finish(task.id, "failed");
+		await settleWorktree(input.worktree);
+		return fail(`启动子会话失败：${error instanceof Error ? error.message : String(error)}`, { kind: "spawn_failed" });
+	}
 	input.tasks.attachProcess(task.id, child.process);
 
 	if (background) {
-		void child.result.then((outcome) => {
-			input.tasks.finish(task.id, isFailedChild(outcome.summary, outcome.exitCode) ? "failed" : "completed");
-		});
-		return ok(JSON.stringify({ taskId: task.id, status: "running", agent: agent.name }), {
-			taskId: task.id,
-			status: "running",
-		});
+		void child.result
+			.then((outcome) =>
+				input.tasks.finish(task.id, isFailedChild(outcome.summary, outcome.exitCode) ? "failed" : "completed"),
+			)
+			.catch(() => input.tasks.finish(task.id, "failed"))
+			.finally(() => void settleWorktree(input.worktree));
+
+		return ok(
+			JSON.stringify({ taskId: task.id, status: "running", agent: agent.name, worktree: input.worktree?.path }),
+			{ taskId: task.id, status: "running" },
+		);
 	}
 
 	const outcome = await child.result;
 	const failed = isFailedChild(outcome.summary, outcome.exitCode);
 	input.tasks.finish(task.id, failed ? "failed" : "completed");
+	const worktree = await settleWorktree(input.worktree);
 
 	const summary = summarizeForModel({
 		agent: agent.name,
@@ -509,125 +624,176 @@ async function runOne(input: {
 	});
 
 	const text = outcome.summary.text || outcome.summary.errorMessage || "（子会话没有返回文本）";
-	return failed ? fail(text, summary) : ok(text, summary);
+	return failed ? fail(text, summary) : ok(text, { ...summary, worktree });
 }
 
-async function runParallel(input: {
-	tasks: TaskRuntime;
-	pool: AgentDefinition[];
-	items: Array<{ agent: string; task: string; cwd?: string }>;
-	cwd: string;
-	params: { model?: string; thinking_level?: string };
-	signal?: AbortSignal;
-	ctx: ExtensionToolContext;
-}) {
-	const started = await Promise.all(
-		input.items.map(async (item) => {
-			const agent = findAgent(input.pool, item.agent);
-			if (!agent) return { item, error: missingAgent(item.agent, input.pool) };
+type ChildRun = Awaited<ReturnType<typeof runChild>>;
 
-			const begun = input.tasks.begin({
-				kind: "subagent",
-				description: `${agent.name}：${item.task.slice(0, 60)}`,
-				deliver: "digest",
+interface ParallelEntry {
+	agent: string;
+	task: string;
+	taskId?: string;
+	child?: ChildRun;
+	errorText?: string;
+}
+
+async function runParallel(input: RunContext & { items: Array<{ agent: string; task: string; cwd?: string }> }) {
+	const entries: ParallelEntry[] = [];
+
+	// 先把所有子会话都拉起来，再统一收结果。
+	// 先 Promise.all 再挂回调，会在 spawn 抛错时让已经起来的任务永远停在 running，
+	// 把并发槽全锁死——之后整会话的 subagent / monitor 都会 concurrency_exceeded。
+	for (const item of input.items) {
+		const agent = findAgent(input.pool, item.agent);
+		if (!agent) {
+			entries.push({
+				agent: item.agent,
+				task: item.task,
+				errorText: firstLine(textOf(missingAgent(item.agent, input.pool))),
 			});
-			if (!begun.ok) return { item, error: fail(beginFailureText(begun.reason), { kind: begun.reason }) };
+			continue;
+		}
 
-			const child = await runChild({
-				task: begun.task,
+		const begun = input.tasks.begin({
+			kind: "subagent",
+			description: `${agent.name}：${item.task.slice(0, 60)}`,
+			deliver: "digest",
+		});
+		if (!begun.ok) {
+			entries.push({ agent: agent.name, task: item.task, errorText: beginFailureText(begun.reason) });
+			continue;
+		}
+
+		const task = begun.task;
+		const entry: ParallelEntry = { agent: agent.name, task: item.task, taskId: task.id };
+		entries.push(entry);
+
+		try {
+			if (!(await waitForSlot(task, begun.ready, input.signal))) {
+				input.tasks.finish(task.id, "stopped");
+				entry.errorText = "排队期间被取消";
+				continue;
+			}
+			entry.child = await runChild({
+				task,
 				agent,
 				taskText: item.task,
 				cwd: item.cwd ?? input.cwd,
-				...(input.params.model ? { model: input.params.model } : {}),
-				...(input.params.thinking_level ? { thinkingLevel: input.params.thinking_level } : {}),
-				...(input.signal ? { signal: input.signal } : {}),
+				...resolveDispatch(agent, input.params, input.ctx),
+				signal: combinedSignal(input.signal, task),
 			});
-			input.tasks.attachProcess(begun.task.id, child.process);
-			return { item, agent, taskId: begun.task.id, child };
-		}),
-	);
+			input.tasks.attachProcess(task.id, entry.child.process);
+		} catch (error) {
+			input.tasks.finish(task.id, "failed");
+			entry.errorText = error instanceof Error ? error.message : String(error);
+		}
+	}
 
-	const results = await Promise.all(
-		started.map(async (entry) => {
-			if ("error" in entry) return { agent: entry.item.agent, status: "failed", text: "无法启动", error: true };
-			if (!entry.child || !entry.taskId) return { agent: entry.item.agent, status: "failed", text: "无法启动", error: true };
+	const results = [];
+	for (const entry of entries) {
+		if (!entry.child || !entry.taskId) {
+			results.push({
+				agent: entry.agent,
+				task: entry.task,
+				status: "failed",
+				text: entry.errorText ?? "无法启动",
+				error: true,
+			});
+			continue;
+		}
+		const outcome = await entry.child.result;
+		const failed = isFailedChild(outcome.summary, outcome.exitCode);
+		// 任一任务失败不取消其他任务；结果逐任务报告
+		input.tasks.finish(entry.taskId, failed ? "failed" : "completed");
+		results.push({
+			agent: entry.agent,
+			task: entry.task,
+			taskId: entry.taskId,
+			status: failed ? "failed" : "completed",
+			text: outcome.summary.text || outcome.summary.errorMessage || "",
+			toolCalls: outcome.summary.toolCalls,
+			error: failed,
+		});
+	}
 
-			const outcome = await entry.child.result;
-			const failed = isFailedChild(outcome.summary, outcome.exitCode);
-			// 任一任务失败不取消其他任务；结果逐任务报告
-			input.tasks.finish(entry.taskId, failed ? "failed" : "completed");
-			return {
-				agent: entry.item.agent,
-				task: entry.item.task,
-				taskId: entry.taskId,
-				status: failed ? "failed" : "completed",
-				text: outcome.summary.text || outcome.summary.errorMessage || "",
-				toolCalls: outcome.summary.toolCalls,
-				error: failed,
-			};
-		}),
-	);
-
+	const worktree = await settleWorktree(input.worktree);
 	const anyFailed = results.some((result) => result.error);
 	// 完整输出留在任务详情里，这里只回摘要，避免一次性撑大主上下文
 	const headline = results
 		.map((result) => `- ${result.agent}：${result.status}${result.text ? ` —— ${firstLine(result.text)}` : ""}`)
 		.join("\n");
 
-	return anyFailed ? fail(headline, { results }) : ok(headline, { results });
+	return anyFailed ? fail(headline, { results, worktree }) : ok(headline, { results, worktree });
 }
 
-async function runChain(input: {
-	tasks: TaskRuntime;
-	pool: AgentDefinition[];
-	steps: Array<{ agent: string; task: string; cwd?: string }>;
-	cwd: string;
-	params: { model?: string; thinking_level?: string };
-	signal?: AbortSignal;
-	ctx: ExtensionToolContext;
-}) {
+async function runChain(input: RunContext & { steps: Array<{ agent: string; task: string; cwd?: string }> }) {
 	const results: Array<{ agent: string; status: string; text: string }> = [];
 	let previous: string | undefined;
 
 	for (const step of input.steps) {
 		const agent = findAgent(input.pool, step.agent);
-		if (!agent) return missingAgent(step.agent, input.pool);
+		if (!agent) {
+			await settleWorktree(input.worktree);
+			return missingAgent(step.agent, input.pool);
+		}
 
 		const begun = input.tasks.begin({
 			kind: "subagent",
 			description: `${agent.name}（链式）：${step.task.slice(0, 50)}`,
 			deliver: "digest",
 		});
-		if (!begun.ok) return fail(beginFailureText(begun.reason), { kind: begun.reason });
+		if (!begun.ok) {
+			await settleWorktree(input.worktree);
+			return fail(beginFailureText(begun.reason), { kind: begun.reason });
+		}
 
-		const child = await runChild({
-			task: begun.task,
-			agent,
-			taskText: applyChainStep(step.task, previous),
-			cwd: step.cwd ?? input.cwd,
-			...(input.params.model ? { model: input.params.model } : {}),
-			...(input.params.thinking_level ? { thinkingLevel: input.params.thinking_level } : {}),
-			...(input.signal ? { signal: input.signal } : {}),
-		});
-		input.tasks.attachProcess(begun.task.id, child.process);
+		const task = begun.task;
+		let child: ChildRun;
+		try {
+			if (!(await waitForSlot(task, begun.ready, input.signal))) {
+				input.tasks.finish(task.id, "stopped");
+				await settleWorktree(input.worktree);
+				return fail("链式任务在排队期间被取消。", { kind: "cancelled" });
+			}
+			child = await runChild({
+				task,
+				agent,
+				taskText: applyChainStep(step.task, previous),
+				cwd: step.cwd ?? input.cwd,
+				...resolveDispatch(agent, input.params, input.ctx),
+				signal: combinedSignal(input.signal, task),
+			});
+		} catch (error) {
+			input.tasks.finish(task.id, "failed");
+			await settleWorktree(input.worktree);
+			return fail(`启动子会话失败：${error instanceof Error ? error.message : String(error)}`, { kind: "spawn_failed" });
+		}
+		input.tasks.attachProcess(task.id, child.process);
 
 		const outcome = await child.result;
 		const failed = isFailedChild(outcome.summary, outcome.exitCode);
-		input.tasks.finish(begun.task.id, failed ? "failed" : "completed");
+		input.tasks.finish(task.id, failed ? "failed" : "completed");
 		results.push({ agent: agent.name, status: failed ? "failed" : "completed", text: outcome.summary.text });
 
 		// 中间步骤失败时停止后续步骤
 		if (failed) {
+			const worktree = await settleWorktree(input.worktree);
 			return fail(
 				`链式在第 ${results.length} 步（${agent.name}）失败，后续步骤已停止。\n${firstLine(outcome.summary.text || outcome.summary.errorMessage || "")}`,
-				{ results },
+				{ results, worktree },
 			);
 		}
 		previous = outcome.summary.text;
 	}
 
+	const worktree = await settleWorktree(input.worktree);
 	const headline = results.map((result) => `- ${result.agent}：${result.status} —— ${firstLine(result.text)}`).join("\n");
-	return ok(headline, { results, final: previous });
+	return ok(headline, { results, final: previous, worktree });
+}
+
+/** 从工具结果里取出给模型看的那段文本。 */
+function textOf(result: { content: Array<{ type: string; text?: string }> }): string {
+	return result.content.map((part) => part.text ?? "").join("");
 }
 
 function firstLine(text: string): string {

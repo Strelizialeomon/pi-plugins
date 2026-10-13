@@ -7,6 +7,7 @@ import {
 	needsProjectTrust,
 	parseAgentFile,
 	parseJsonLines,
+	safeFileName,
 	selectAgents,
 	summarizeChildOutput,
 } from "./subagent.ts";
@@ -197,7 +198,15 @@ const assistant = (over: Record<string, unknown> = {}) => ({
 		model: "claude-opus-5-5",
 		stopReason: "endTurn",
 		content: [{ type: "text", text: "结论正文" }],
-		usage: { input: 10, output: 20, cacheRead: 1, cacheWrite: 2, totalTokens: 33, costTotal: 0.25 },
+		// 真实形状：成本在 cost.total 下，不是一个叫 costTotal 的平铺字段
+		usage: {
+			input: 10,
+			output: 20,
+			cacheRead: 1,
+			cacheWrite: 2,
+			totalTokens: 33,
+			cost: { input: 0.1, output: 0.15, cacheRead: 0, cacheWrite: 0, total: 0.25 },
+		},
 		...over,
 	},
 });
@@ -215,16 +224,48 @@ test("usage 跨消息累加", () => {
 	const summary = summarizeChildOutput([assistant(), assistant()]);
 	assert.equal(summary.usage.input, 20);
 	assert.equal(summary.usage.totalTokens, 66);
-	assert.ok(Math.abs(summary.usage.costTotal - 0.5) < 1e-9);
+	assert.ok(Math.abs(summary.usage.cost.total - 0.5) < 1e-9, `成本应从 cost.total 累加，实际 ${summary.usage.cost.total}`);
 });
 
-test("数工具调用次数", () => {
+test("一次工具调用只数一次 —— start 与 end 是同一件事的两条事件", () => {
 	const summary = summarizeChildOutput([
 		{ type: "tool_execution_start" },
 		{ type: "tool_execution_end" },
 		assistant(),
 	]);
+	assert.equal(summary.toolCalls, 1, "start/end 各数一次会把调用数翻倍");
+});
+
+test("多次调用按 start 计数", () => {
+	const summary = summarizeChildOutput([
+		{ type: "tool_execution_start" },
+		{ type: "tool_execution_end" },
+		{ type: "tool_execution_start" },
+		{ type: "tool_execution_end" },
+		{ type: "tool_execution_end" },
+	]);
 	assert.equal(summary.toolCalls, 2);
+});
+
+test("成本从 usage.cost.total 累加，而不是一个不存在的平铺字段", () => {
+	const summary = summarizeChildOutput([assistant()]);
+	assert.ok(Math.abs(summary.usage.cost.total - 0.25) < 1e-9, `实际 ${summary.usage.cost.total}`);
+	assert.equal(Object.hasOwn(summary.usage, "costTotal"), false, "不该凭空造 costTotal 字段");
+});
+
+// —— agent 名字是不可信输入 ——
+
+test("safeFileName 挡住路径穿越", () => {
+	assert.equal(safeFileName("../../../../tmp/x").includes(".."), false);
+	assert.equal(safeFileName("../../../../tmp/x").includes("/"), false);
+	assert.equal(safeFileName("a/b").includes("/"), false);
+});
+
+test("safeFileName 保留正常名字，空名字有兜底", () => {
+	assert.equal(safeFileName("reviewer"), "reviewer");
+	assert.equal(safeFileName("code-reviewer.v2"), "code-reviewer.v2");
+	assert.equal(safeFileName("..."), "agent");
+	assert.equal(safeFileName(""), "agent");
 });
 
 test("非 assistant 的消息不污染结果", () => {

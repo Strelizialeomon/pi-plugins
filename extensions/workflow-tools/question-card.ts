@@ -105,6 +105,14 @@ export function validateQuestions(raw: unknown): ValidationResult {
 		}
 
 		if (!Array.isArray(q.options)) return { ok: false, error: `${at}缺少 \`options\`。` };
+		for (const opt of q.options) {
+			const label = typeof opt === "object" && opt !== null ? (opt as { label?: unknown }).label : undefined;
+			// 卡片自己要用 Other 行，RPC 降级还要用「选完了 / 取消」做终止项。
+			// 模型若拿这些当 label，会撞上保留字，行为不是它想要的。
+			if (typeof label === "string" && RESERVED_LABELS.includes(label)) {
+				return { ok: false, error: `${at}的选项 label「${label}」是保留字，请换一个。` };
+			}
+		}
 		if (q.options.length < MIN_OPTIONS || q.options.length > MAX_OPTIONS) {
 			return {
 				ok: false,
@@ -158,7 +166,10 @@ export function buildAnsweredResult(input: { picks: Pick[] }): AnsweredResult {
 	for (const pick of input.picks) {
 		const other = pick.other?.trim();
 		if (other) {
-			answers[pick.id] = other;
+			// 勾选项和自由输入要一起交给模型。只回 other 的话，
+			// 用户看到的「A、B + 补充」到模型手里只剩补充那一句。
+			const merged = [...pick.selected, other];
+			answers[pick.id] = merged.join(", ");
 			responses[pick.id] = other;
 			hasResponse = true;
 		} else {
@@ -188,6 +199,9 @@ export function buildAnsweredResult(input: { picks: Pick[] }): AnsweredResult {
 const OTHER_LABEL = "Other";
 const DONE_LABEL = "✓ 选完了";
 const CANCEL_LABEL = "✗ 取消";
+
+/** 卡片与 RPC 降级自己要用这些文案，模型不能再拿它们当选项 label。 */
+const RESERVED_LABELS = [OTHER_LABEL, DONE_LABEL, CANCEL_LABEL];
 
 /** 同一会话同时只允许一张活动卡片。并发调用直接拿到 busy。 */
 let cardOpen = false;
@@ -302,12 +316,12 @@ class QuestionCard implements Component {
 			if (this.#isOther()) {
 				this.#typing = true;
 			} else {
-				const label = this.#current().options[this.#cursor]?.label ?? "";
+				// 多选时 Enter 只负责确认，不再顺手把光标所在项加进去——
+				// 那样「勾了 A、移到 B 按确认」会变成 A+B。
 				if (!this.#current().multiSelect) {
+					const label = this.#current().options[this.#cursor]?.label ?? "";
 					this.#chosen[this.#index] = new Set([label]);
 					this.#other[this.#index] = undefined;
-				} else {
-					(this.#chosen[this.#index] as Set<string>).add(label);
 				}
 				this.#commitQuestion();
 			}
@@ -340,24 +354,41 @@ class QuestionCard implements Component {
 		const otherText = this.#typing ? this.#draft : (otherValue ?? "");
 		lines.push(`${otherPointer}    ${OTHER_LABEL}${otherText ? `：${otherText}` : ""}`);
 
+		// 预览只跟随当前高亮的选项，且不进答案文本
+		const focused = this.#isOther() ? undefined : question.options[this.#cursor]?.preview;
+		if (focused) {
+			lines.push("─".repeat(3));
+			lines.push(...focused.split("\n"));
+			lines.push("─".repeat(3));
+		}
+
 		lines.push(this.#typing ? "输入中 —— Enter 提交 · Esc 退回" : "↑↓ 移动 · 空格 切换 · Enter 确认 · Esc 取消");
 		return lines.map((line) => truncateToWidth(line, width));
 	}
 }
 
-/** RPC 只有单值 select，多选按题拆成连续单选，preview 丢弃并标 degraded。 */
-async function askViaRpc(ctx: ExtensionContext, questions: QuestionSpec[]): Promise<Pick[] | undefined> {
+/**
+ * RPC 只有单值 select，多选按题拆成连续单选，preview 丢弃并标 degraded。
+ * `opts.signal` 必须传：客户端崩了或不回包时，只有 abort 能把 promise 落定，
+ * 否则 `cardOpen` 会永久卡住，之后每次调用都返回 busy。
+ */
+async function askViaRpc(
+	ctx: ExtensionContext,
+	questions: QuestionSpec[],
+	signal?: AbortSignal,
+): Promise<Pick[] | undefined> {
 	const picks: Pick[] = [];
 	const title = (q: QuestionSpec) => `${q.header} · ${q.question}`;
+	const opts = signal ? { signal } : undefined;
 
 	for (const q of questions) {
 		const labels = q.options.map((option) => option.label);
 
 		if (!q.multiSelect) {
-			const picked = await ctx.ui.select(title(q), [...labels, OTHER_LABEL, CANCEL_LABEL]);
+			const picked = await ctx.ui.select(title(q), [...labels, OTHER_LABEL, CANCEL_LABEL], opts);
 			if (picked === undefined || picked === CANCEL_LABEL) return undefined;
 			if (picked === OTHER_LABEL) {
-				const typed = await ctx.ui.input(q.question, "自由输入");
+				const typed = await ctx.ui.input(q.question, "自由输入", opts);
 				if (typed === undefined) return undefined;
 				picks.push({ id: q.id, selected: [], other: typed, degraded: true });
 			} else {
@@ -370,11 +401,11 @@ async function askViaRpc(ctx: ExtensionContext, questions: QuestionSpec[]): Prom
 		// 轮数封顶，避免用户一直不点完成时把循环挂死。
 		const chosen: string[] = [];
 		for (let round = 0; round <= q.options.length; round++) {
-			const picked = await ctx.ui.select(`${title(q)}（已选：${chosen.join("、") || "无"}）`, [
-				...labels,
-				DONE_LABEL,
-				CANCEL_LABEL,
-			]);
+			const picked = await ctx.ui.select(
+				`${title(q)}（已选：${chosen.join("、") || "无"}）`,
+				[...labels, DONE_LABEL, CANCEL_LABEL],
+				opts,
+			);
 			if (picked === undefined || picked === CANCEL_LABEL) return undefined;
 			if (picked === DONE_LABEL) break;
 			const at = chosen.indexOf(picked);
@@ -394,6 +425,7 @@ async function askViaRpc(ctx: ExtensionContext, questions: QuestionSpec[]): Prom
 export async function askQuestions(
 	ctx: ExtensionContext,
 	questions: QuestionSpec[],
+	signal?: AbortSignal,
 ): Promise<AnsweredResult | typeof CANCELLED | typeof BUSY | ReturnType<typeof uiUnavailable>> {
 	if (cardOpen) return BUSY;
 	if (ctx.mode !== "tui" && !ctx.hasUI) return uiUnavailable(ctx.mode);
@@ -412,7 +444,7 @@ export async function askQuestions(
 				),
 			);
 		} else {
-			picks = await askViaRpc(ctx, questions);
+			picks = await askViaRpc(ctx, questions, signal);
 		}
 
 		if (picks === undefined) return CANCELLED;

@@ -83,6 +83,37 @@ test("Other 自由输入的原文同时写进 answers[id] 和 responses[id]", ()
 	assert.equal(result.responses?.q1, "我自己写一个");
 });
 
+test("多选 + Other 时，勾选项不能被自由输入吃掉", () => {
+	const result = buildAnsweredResult({
+		picks: [{ id: "q1", selected: ["A", "B"], other: "补充一句" }],
+	});
+	assert.ok(result.answers.q1.includes("A"), `实际：${result.answers.q1}`);
+	assert.ok(result.answers.q1.includes("B"), `实际：${result.answers.q1}`);
+	assert.ok(result.answers.q1.includes("补充一句"), `实际：${result.answers.q1}`);
+	assert.equal(result.responses?.q1, "补充一句", "responses 里只放自由输入那一段");
+});
+
+// —— 保留 label：模型不能占用卡片自己要用的文案 ——
+
+test("选项 label 用保留字会被拒（Other / 选完了 / 取消）", () => {
+	for (const reserved of ["Other", "✓ 选完了", "✗ 取消"]) {
+		const options = [
+			{ label: reserved, description: "" },
+			{ label: "正常项", description: "" },
+		];
+		assert.equal(validateQuestions({ questions: [one({ options })] }).ok, false, `${reserved} 应被拒`);
+	}
+});
+
+test("普通 label 不受影响", () => {
+	const options = [
+		{ label: "不审", description: "" },
+		{ label: "轻审", description: "" },
+		{ label: "重审", description: "" },
+	];
+	assert.equal(validateQuestions({ questions: [one({ options })] }).ok, true);
+});
+
 test("没走 Other 的题目不进 responses，保持结果干净", () => {
 	const result = buildAnsweredResult({ picks: [{ id: "q1", selected: ["A"] }] });
 	assert.equal(result.responses, undefined);
