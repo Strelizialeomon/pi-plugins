@@ -459,6 +459,34 @@ test("monitor：真跑一条 shell，taskId 立刻返回、输出行进环形缓
 	assert.equal(terminal.options?.triggerTurn, true, "终态必须带 triggerTurn，否则空闲会话收不到");
 });
 
+test("monitor：stderr 也算事件，且不会把管道堵死", async () => {
+	const { pi, tools, sent } = makePi();
+	plugin(pi);
+
+	await tools
+		.get("monitor")!
+		.execute(
+			"c",
+			{
+				description: "往 stderr 写",
+				// 往 stderr 灌 ~100KB，超过 64KB 管道缓冲：没人读就会卡在这里
+				command: "for i in $(seq 1 3000); do echo 'stderr line ..............................' >&2; done; echo done >&2",
+				deliver: "terminal",
+			},
+			undefined,
+			undefined,
+			makeCtx("json"),
+		);
+
+	for (let i = 0; i < 200 && !sent.some((m) => m.customType === "workflow-tools:terminal"); i++) {
+		await new Promise((r) => setTimeout(r, 50));
+	}
+
+	const terminal = sent.find((message) => message.customType === "workflow-tools:terminal");
+	assert.ok(terminal, "stderr 写满后命令被堵死，没等到终态");
+	assert.ok(String(terminal.content).includes("done"), `终态该带上 stderr 的尾巴，实际：${terminal?.content}`);
+});
+
 test("monitor：deliver terminal 时进度不逐条进上下文", async () => {
 	const { pi, tools, sent } = makePi();
 	plugin(pi);
@@ -524,7 +552,7 @@ test("subagent：找不到 agent 时把可用的列出来，让模型能自我�
 	assert.ok(textOf(result).includes("可用"), "错误里要给可用清单");
 });
 
-test("subagent：tasks 与 chain 同时给会被拒", async () => {
+test("subagent：tasks 与 chain 同时给会被拒，且拒的理由是互斥不是别的", async () => {
 	const { pi, tools } = makePi();
 	plugin(pi);
 	const result = await tools
@@ -532,6 +560,8 @@ test("subagent：tasks 与 chain 同时给会被拒", async () => {
 		.execute("c", { tasks: [{ agent: "a", task: "t" }], chain: [{ agent: "b", task: "t" }] }, undefined, undefined, makeCtx("json"));
 
 	assert.equal(result.isError, true);
+	assert.equal((result.details as { kind?: string }).kind, "invalid_arguments");
+	assert.ok(textOf(result).includes("只能给一个"), `拒的理由要指向互斥，实际：${textOf(result)}`);
 });
 
 test("subagent：一次超过 8 个并行任务直接拒绝", async () => {
