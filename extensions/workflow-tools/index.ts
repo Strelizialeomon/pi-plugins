@@ -420,7 +420,7 @@ async function waitForSlot(task: RunningTask, ready: Promise<void>, signal?: Abo
 }
 
 /** 子会话用哪个模型 / 思考档：显式参数 > agent 文件 > 父会话。 */
-function resolveDispatch(
+export function resolveDispatch(
 	agent: AgentDefinition,
 	params: { model?: string; thinking_level?: string },
 	ctx: ExtensionToolContext,

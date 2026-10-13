@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+	createIsolatedWorktree,
+	releaseWorktree,
 	applyChainStep,
 	buildChildArgs,
 	isFailedChild,
@@ -130,6 +136,58 @@ test("没有占位符时原样返回，不偷偷拼接", () => {
 
 test("第一步没有前序结果，占位符原样留着（不替换成 undefined）", () => {
 	assert.equal(applyChainStep("看 {previous}", undefined), "看 {previous}");
+});
+
+// —— worktree 隔离：改动留在里面，有未提交就不删 ——
+
+function makeTempRepo(): string {
+	const dir = mkdtempSync(join(tmpdir(), "wf-repo-"));
+	const git = (args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+	git(["init", "-q"]);
+	git(["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"]);
+	return dir;
+}
+
+test("建出来的 worktree 能用，且不在原仓库目录里", async () => {
+	const repo = makeTempRepo();
+	const created = await createIsolatedWorktree(repo);
+	assert.ok(created.ok, `建 worktree 失败：${created.ok ? "" : created.error}`);
+	if (!created.ok) return;
+
+	assert.ok(existsSync(created.handle.path), "worktree 目录没建出来");
+	assert.ok(!created.handle.path.startsWith(repo + "/"), "worktree 不该落在原仓库里面");
+	assert.equal(execFileSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd: created.handle.path, encoding: "utf8" }).trim(), "true");
+
+	await releaseWorktree(created.handle);
+});
+
+test("干净的 worktree 会被收掉", async () => {
+	const repo = makeTempRepo();
+	const created = await createIsolatedWorktree(repo);
+	if (!created.ok) return assert.fail(created.error);
+	const { path } = created.handle;
+
+	const released = await releaseWorktree(created.handle);
+	assert.equal(released.removed, true, `应当移除，理由：${released.reason}`);
+	assert.equal(existsSync(path), false, "目录该没了");
+});
+
+test("有未提交改动的 worktree 不删，把路径留下来", async () => {
+	const repo = makeTempRepo();
+	const created = await createIsolatedWorktree(repo);
+	if (!created.ok) return assert.fail(created.error);
+	const { path } = created.handle;
+
+	// 模拟子会话在里面改了东西没提交
+	writeFileSync(join(path, "half-done.txt"), "还没提交的成果\n");
+
+	const released = await releaseWorktree(created.handle);
+	assert.equal(released.removed, false, "有未提交改动时不该删");
+	assert.ok(released.reason?.includes("未提交"), `理由该点明原因，实际：${released.reason}`);
+	assert.ok(existsSync(join(path, "half-done.txt")), "成果必须还在");
+
+	// 收尾：手动清掉，别把临时目录留在机器上
+	execFileSync("git", ["worktree", "remove", "--force", path], { cwd: repo, stdio: "pipe" });
 });
 
 // —— 子 Pi 命令行 ——

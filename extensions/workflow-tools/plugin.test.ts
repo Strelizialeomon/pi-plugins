@@ -10,11 +10,12 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import plugin from "./index.ts";
+import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import plugin, { resolveDispatch } from "./index.ts";
+import type { AgentDefinition } from "./subagent.ts";
 
 // —— 测试替身 ——
 
@@ -89,7 +90,7 @@ function makeCtx(mode: "tui" | "rpc" | "json", ui: Record<string, unknown> = {})
 			...ui,
 		},
 	};
-	return ctx as unknown as ExtensionContext & { ui: Record<string, never> };
+	return ctx as unknown as ExtensionToolContext;
 }
 
 function textOf(result: { content: Array<{ text?: string }> }): string {
@@ -572,6 +573,95 @@ test("subagent：一次超过 8 个并行任务直接拒绝", async () => {
 
 	assert.equal(result.isError, true);
 	assert.equal((result.details as { kind?: string }).kind, "concurrency_exceeded");
+});
+
+// —— 子会话的模型 / 思考档 ——
+
+const agent = (over: Partial<AgentDefinition> = {}): AgentDefinition => ({
+	name: "reviewer",
+	description: "",
+	systemPrompt: "你是 reviewer",
+	source: "user",
+	path: "/tmp/reviewer.md",
+	...over,
+});
+
+test("什么都不指定时继承父会话的模型与思考档", () => {
+	const ctx = makeCtx("json"); // model = anthropic/claude-haiku-5-5, thinkingLevel = medium
+	assert.deepEqual(resolveDispatch(agent(), {}, ctx), {
+		model: "anthropic/claude-haiku-5-5",
+		thinkingLevel: "medium",
+	});
+});
+
+test("显式参数覆盖父会话", () => {
+	const ctx = makeCtx("json");
+	assert.deepEqual(resolveDispatch(agent(), { model: "openai/gpt-5", thinking_level: "high" }, ctx), {
+		model: "openai/gpt-5",
+		thinkingLevel: "high",
+	});
+});
+
+test("agent 文件里的 model 优先于父会话，且此时不再继承思考档", () => {
+	const ctx = makeCtx("json");
+	// thinking 是父模型调的档，换了模型就不该照搬
+	assert.deepEqual(resolveDispatch(agent({ model: "anthropic/claude-opus-5-5" }), {}, ctx), {
+		model: "anthropic/claude-opus-5-5",
+	});
+});
+
+test("显式指定模型时同样不继承思考档", () => {
+	const ctx = makeCtx("json");
+	assert.deepEqual(resolveDispatch(agent(), { model: "openai/gpt-5" }, ctx), { model: "openai/gpt-5" });
+});
+
+test("父会话没有模型时不硬塞 --model，交给子 Pi 自己选", () => {
+	const ctx = makeCtx("json");
+	(ctx as unknown as { model: undefined }).model = undefined;
+	const result = resolveDispatch(agent(), {}, ctx);
+	assert.equal(result.model, undefined);
+	assert.equal(result.thinkingLevel, "medium", "没有模型可继承时思考档照旧");
+});
+
+// —— 取消要收掉整棵进程树 ——
+
+test("取消会连孙进程一起收掉，不留孤儿", async () => {
+	const { pi, tools } = makePi();
+	plugin(pi);
+	const marker = join(mkdtempSync(join(tmpdir(), "wf-pg-")), "child.pid");
+	const ctx = makeCtx("json");
+
+	const started = await tools.get("monitor")!.execute(
+		"c",
+		{
+			description: "带孙进程",
+			// sh 是进程组组长，后台的 sleep 是它的子进程 —— 只杀直接子进程时它会活下来
+			command: `sleep 30 & echo $! > ${marker}; wait`,
+		},
+		undefined,
+		undefined,
+		ctx,
+	);
+	const taskId = (started.details as { taskId: string }).taskId;
+
+	for (let i = 0; i < 100 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 50));
+	assert.ok(existsSync(marker), "孙进程没起来，测试前提不成立");
+	const childPid = Number(readFileSync(marker, "utf8").trim());
+	assert.ok(Number.isFinite(childPid) && childPid > 0, `读到的 pid 不合法：${childPid}`);
+
+	await tools.get("task_stop")!.execute("c", { task_id: taskId }, undefined, undefined, ctx);
+
+	let alive = true;
+	for (let i = 0; i < 100; i++) {
+		try {
+			process.kill(childPid, 0);
+			await new Promise((r) => setTimeout(r, 50));
+		} catch {
+			alive = false;
+			break;
+		}
+	}
+	assert.equal(alive, false, `孙进程 ${childPid} 还活着 —— 说明只杀了直接子进程`);
 });
 
 // —— 收尾 ——
