@@ -14,7 +14,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
-import plugin, { resolveDispatch } from "./index.ts";
+import plugin, { resolveDispatch, runChild } from "./index.ts";
 import { buildChildArgs, type AgentDefinition } from "./subagent.ts";
 
 // —— 测试替身 ——
@@ -642,6 +642,33 @@ test("resolveDispatch 的结果真能拼进子 Pi 命令行", () => {
 	assert.equal(args[args.indexOf("--model") + 1], "anthropic/claude-haiku-5-5");
 	assert.ok(args.includes("--thinking"));
 	assert.equal(args[args.indexOf("--thinking") + 1], "high");
+});
+
+test("runChild 把算好的模型 / 思考档真送进子会话启动参数", async () => {
+	const ctx = makeCtx("json");
+	let captured: { model?: string; thinkingLevel?: string; task?: string; isolate?: boolean } | undefined;
+	const fakeStart = (async (inputValue: Record<string, unknown>) => {
+		captured = inputValue as typeof captured;
+		return { process: { signal() {}, exited: Promise.resolve() }, result: Promise.resolve({}) };
+	}) as unknown as Parameters<typeof runChild>[1];
+
+	await runChild(
+		{
+			task: { id: "t1", ring: { push: () => {} } } as unknown as Parameters<typeof runChild>[0]["task"],
+			agent: agent(),
+			taskText: "干活",
+			cwd: scratchRoot,
+			params: {},
+			ctx,
+		},
+		fakeStart,
+	);
+
+	// 少了这层，光测 resolveDispatch 是锁不住的：调用点漏了展开照样绿
+	assert.equal(captured?.model, "anthropic/claude-haiku-5-5", `实际拿到：${JSON.stringify(captured)}`);
+	assert.equal(captured?.thinkingLevel, "medium");
+	assert.equal(captured?.task, "干活");
+	assert.equal(captured?.isolate, true, "子会话必须隔离");
 });
 
 test("agent 文件里的 model 优先于父会话，且此时不再继承思考档", () => {

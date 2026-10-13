@@ -521,16 +521,21 @@ function summarizeForModel(input: {
  * 起子会话。模型 / 思考档的取舍在这里一次算清，调用方只管传 params 和 ctx——
  * 展开写在每个调用点上，改一处漏一处就会让子会话静默退回父会话默认值。
  */
-async function runChild(input: {
-	task: RunningTask;
-	agent: AgentDefinition;
-	taskText: string;
-	cwd: string;
-	params: { model?: string; thinking_level?: string };
-	ctx: ExtensionToolContext;
-	signal?: AbortSignal;
-}) {
-	return await startChildPi({
+export async function runChild(
+	input: {
+		task: RunningTask;
+		agent: AgentDefinition;
+		taskText: string;
+		cwd: string;
+		params: { model?: string; thinking_level?: string };
+		ctx: ExtensionToolContext;
+		signal?: AbortSignal;
+	},
+	// 只在测试里换掉：这一层的全部职责就是把算好的参数交给子会话启动，
+	// 不注入就只能靠真起一个子进程来验。
+	startChild: typeof startChildPi = startChildPi,
+) {
+	return await startChild({
 		agent: input.agent,
 		task: input.taskText,
 		cwd: input.cwd,
