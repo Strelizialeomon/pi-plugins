@@ -1,6 +1,12 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import {
+	createIsolatedWorktree,
+	releaseWorktree,
 	applyChainStep,
 	buildChildArgs,
 	isFailedChild,
@@ -130,6 +136,106 @@ test("没有占位符时原样返回，不偷偷拼接", () => {
 
 test("第一步没有前序结果，占位符原样留着（不替换成 undefined）", () => {
 	assert.equal(applyChainStep("看 {previous}", undefined), "看 {previous}");
+});
+
+// —— worktree 隔离：改动留在里面，有未提交就不删 ——
+
+// 隔离全局 git 配置：这台机器没开 gpgsign 不代表别的机器没有，
+// 不然这三条测试会在别人机器上红，报的错还和产品无关。
+const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, stdio: "pipe", env: GIT_ENV });
+
+const scratchDirs: string[] = [];
+
+after(() => {
+	for (const dir of scratchDirs) rmSync(dir, { recursive: true, force: true });
+});
+
+function makeTempRepo(): string {
+	const dir = mkdtempSync(join(tmpdir(), "wf-repo-"));
+	scratchDirs.push(dir);
+	git(dir, ["init", "-q"]);
+	git(dir, [
+		"-c",
+		"user.email=t@example.com",
+		"-c",
+		"user.name=t",
+		"-c",
+		"commit.gpgsign=false",
+		"commit",
+		"-q",
+		"--allow-empty",
+		"-m",
+		"init",
+	]);
+	return dir;
+}
+
+/** 取真实路径：macOS 上 /tmp 是 /private/tmp 的软链，git 报的是展开后的。 */
+function canonical(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch {
+		return path;
+	}
+}
+
+/** 主仓里登记的 worktree 列表（用来验「不只是删目录，登记也注销了」）。 */
+function registeredWorktrees(repo: string): string[] {
+	return git(repo, ["worktree", "list", "--porcelain"])
+		.toString()
+		.split("\n")
+		.filter((line) => line.startsWith("worktree "))
+		.map((line) => canonical(line.slice("worktree ".length).trim()));
+}
+
+test("建出来的 worktree 能用，且不在原仓库目录里", async () => {
+	const repo = makeTempRepo();
+	const created = await createIsolatedWorktree(repo);
+	assert.ok(created.ok, `建 worktree 失败：${created.ok ? "" : created.error}`);
+	if (!created.ok) return;
+
+	assert.ok(existsSync(created.handle.path), "worktree 目录没建出来");
+	assert.ok(!created.handle.path.startsWith(repo + "/"), "worktree 不该落在原仓库里面");
+	assert.equal(git(created.handle.path, ["rev-parse", "--is-inside-work-tree"]).toString().trim(), "true");
+	assert.ok(registeredWorktrees(repo).includes(canonical(created.handle.path)), "主仓里该有它的登记");
+
+	await releaseWorktree(created.handle);
+});
+
+test("干净的 worktree 会被收掉，登记也一并注销", async () => {
+	const repo = makeTempRepo();
+	const created = await createIsolatedWorktree(repo);
+	if (!created.ok) return assert.fail(created.error);
+	const { path } = created.handle;
+	// 趁目录还在先取真实路径——删掉之后 realpath 就取不到了
+	const worktreePath = canonical(path);
+
+	const released = await releaseWorktree(created.handle);
+	assert.equal(released.removed, true, `应当移除，理由：${released.reason}`);
+	assert.equal(existsSync(path), false, "目录该没了");
+	// 只 rm -rf 目录不注销登记的话，主仓 .git/worktrees 里会留下永久残留
+	assert.equal(registeredWorktrees(repo).includes(worktreePath), false, "主仓里不该还留着它的登记");
+});
+
+test("有未提交改动的 worktree 不删，把路径留下来", async () => {
+	const repo = makeTempRepo();
+	const created = await createIsolatedWorktree(repo);
+	if (!created.ok) return assert.fail(created.error);
+	const { path } = created.handle;
+
+	// 模拟子会话在里面改了东西没提交（未跟踪文件走的是同一个 status 分支）
+	writeFileSync(join(path, "half-done.txt"), "还没提交的成果\n");
+
+	const released = await releaseWorktree(created.handle);
+	assert.equal(released.removed, false, "有未提交改动时不该删");
+	assert.ok(released.reason?.includes("未提交"), `理由该点明原因，实际：${released.reason}`);
+	assert.ok(existsSync(join(path, "half-done.txt")), "成果必须还在");
+	assert.ok(registeredWorktrees(repo).includes(canonical(path)), "登记也该还在，人还得能找回来");
+
+	// 收尾：手动清掉，别把工作区、登记和它的临时父目录留在机器上
+	git(repo, ["worktree", "remove", "--force", path]);
+	rmSync(dirname(path), { recursive: true, force: true });
 });
 
 // —— 子 Pi 命令行 ——

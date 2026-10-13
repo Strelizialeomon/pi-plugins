@@ -5,7 +5,7 @@
  * 判定规则、状态机、投递策略都在各自的模块里，单测不需要起 Pi。
  */
 
-import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionToolContext } from "@earendil-works/pi-coding-agent";
@@ -87,6 +87,7 @@ export default function (pi: ExtensionAPI) {
 		// 收尾顺序由运行时负责：置位 → 拒绝新 spawn → 打进程组 → await 退出。
 		await runtime?.shutdown();
 		runtime = undefined;
+		releaseTaskLogs();
 	});
 
 	// —— ask_user_question ——
@@ -410,6 +411,20 @@ function openTaskLog(taskId: string): LogSink {
 }
 
 /**
+ * 会话结束就把日志目录收掉。留着的话每开一次会话就在临时目录里积一个，
+ * 而且会话都结束了，那条「完整日志：<路径>」也不会再有人去点。
+ */
+function releaseTaskLogs() {
+	if (!logDir) return;
+	try {
+		rmSync(logDir, { recursive: true, force: true });
+	} catch {
+		// 清不掉就留着，不该因为清理失败把收尾搞挂
+	}
+	logDir = undefined;
+}
+
+/**
  * 并发排队：超过 4 个在跑的任务要等空槽，不能直接 spawn。
  * 等的时候任务可能已经被取消，返回 false 表示别再往下走了。
  */
@@ -420,7 +435,7 @@ async function waitForSlot(task: RunningTask, ready: Promise<void>, signal?: Abo
 }
 
 /** 子会话用哪个模型 / 思考档：显式参数 > agent 文件 > 父会话。 */
-function resolveDispatch(
+export function resolveDispatch(
 	agent: AgentDefinition,
 	params: { model?: string; thinking_level?: string },
 	ctx: ExtensionToolContext,
@@ -502,21 +517,29 @@ function summarizeForModel(input: {
 	};
 }
 
-async function runChild(input: {
-	task: RunningTask;
-	agent: AgentDefinition;
-	taskText: string;
-	cwd: string;
-	model?: string;
-	thinkingLevel?: string;
-	signal?: AbortSignal;
-}) {
-	const started = await startChildPi({
+/**
+ * 起子会话。模型 / 思考档的取舍在这里一次算清，调用方只管传 params 和 ctx——
+ * 展开写在每个调用点上，改一处漏一处就会让子会话静默退回父会话默认值。
+ */
+export async function runChild(
+	input: {
+		task: RunningTask;
+		agent: AgentDefinition;
+		taskText: string;
+		cwd: string;
+		params: { model?: string; thinking_level?: string };
+		ctx: ExtensionToolContext;
+		signal?: AbortSignal;
+	},
+	// 只在测试里换掉：这一层的全部职责就是把算好的参数交给子会话启动，
+	// 不注入就只能靠真起一个子进程来验。
+	startChild: typeof startChildPi = startChildPi,
+) {
+	return await startChild({
 		agent: input.agent,
 		task: input.taskText,
 		cwd: input.cwd,
-		...(input.model ? { model: input.model } : {}),
-		...(input.thinkingLevel ? { thinkingLevel: input.thinkingLevel } : {}),
+		...resolveDispatch(input.agent, input.params, input.ctx),
 		...(input.signal ? { signal: input.signal } : {}),
 		// 子会话要真的独立：不带用户级扩展 / 命令 / skills / MCP
 		isolate: true,
@@ -525,7 +548,6 @@ async function runChild(input: {
 			if (typeof event.type === "string") input.task.ring.push(event.type);
 		},
 	});
-	return started;
 }
 
 interface RunContext {
@@ -582,7 +604,8 @@ async function runOne(input: RunContext & { agentName: string; taskText: string 
 			agent,
 			taskText: input.taskText,
 			cwd: input.cwd,
-			...resolveDispatch(agent, input.params, input.ctx),
+			params: input.params,
+			ctx: input.ctx,
 			signal: combinedSignal(input.signal, task),
 		});
 	} catch (error) {
@@ -680,7 +703,8 @@ async function runParallel(input: RunContext & { items: Array<{ agent: string; t
 				agent,
 				taskText: item.task,
 				cwd: item.cwd ?? input.cwd,
-				...resolveDispatch(agent, input.params, input.ctx),
+				params: input.params,
+				ctx: input.ctx,
 				signal: combinedSignal(input.signal, task),
 			});
 			input.tasks.attachProcess(task.id, entry.child.process);
@@ -761,7 +785,8 @@ async function runChain(input: RunContext & { steps: Array<{ agent: string; task
 				agent,
 				taskText: applyChainStep(step.task, previous),
 				cwd: step.cwd ?? input.cwd,
-				...resolveDispatch(agent, input.params, input.ctx),
+				params: input.params,
+				ctx: input.ctx,
 				signal: combinedSignal(input.signal, task),
 			});
 		} catch (error) {
