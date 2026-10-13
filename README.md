@@ -82,7 +82,7 @@ pi --extension ./extensions/workflow-tools/index.ts   # 或只临时加载这一
 - **答案以 `id` 为 key**：每题必须给 `id`，`answers` / `responses` / `annotations` 都用它索引。别依赖问题文本——两条文字相同的问题会互相覆盖。
 - **事件不是逐行进上下文的**：`monitor` 默认按 30 秒窗口把进度合并成一条摘要；传 `deliver: "terminal"` 则进度完全不进上下文，只在任务结束时推一条终态。`tail -f` 这类高频输出不会把上下文灌爆。
 - **终态一定叫得醒你**：终态用 `triggerTurn: true` 推送，会话空闲时也会起一个新回合，不需要轮询或 sleep。
-- **并发上限按会话算**：monitor 与 subagent **合计**最多 8 个任务，单次调用超过 8 个直接返回 `concurrency_exceeded`。其中**「同时最多 4 个在运行」只约束 subagent**——它要新起 Pi 进程、烧模型钱，超出就排队并在结果里报告排位；monitor 只是跑条 shell，不占这 4 个名额，起完立刻返回 `taskId`。
+- **并发上限按会话算**：monitor 与 subagent **合计**最多 8 个任务；单次超过 8 个的闸只加在并行 `tasks` 上（`chain` 逐步串行，不受此限），超了直接返回 `concurrency_exceeded`。其中**「同时最多 4 个在运行」只给 subagent 排队用**——它要新起 Pi 进程、烧模型钱，满槽就等空槽（排位目前不进返回值）。⚠️ **monitor 不排队、但会占名额**：闸只看有没有空槽、不看任务种类，所以有空槽时 monitor 照样占一个运行位，4 个常驻 monitor（`timeout_ms: 0`）能把后续 subagent 一直顶在队列里。
 - **子会话真的独立**：子 Pi 用 `-ne -nc -ns --no-mcp` 起，不带用户级扩展、命令、skills 和 MCP——否则 reviewer 会连上 MCP，还可能递归派发 subagent。
 - **项目级 agent 默认不参与**：要显式传 `agentScope: "project" | "both"`，且项目得先被信任（`confirmProjectAgents: false` 表示调用方自行承担）。
 
