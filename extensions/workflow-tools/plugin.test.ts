@@ -8,14 +8,14 @@
  * 只有真跑一次才知道。
  */
 
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import plugin, { resolveDispatch } from "./index.ts";
-import type { AgentDefinition } from "./subagent.ts";
+import { buildChildArgs, type AgentDefinition } from "./subagent.ts";
 
 // —— 测试替身 ——
 
@@ -70,8 +70,28 @@ function makePi() {
 	};
 }
 
+// 所有 ctx 共用一个工作目录：每次 makeCtx 建一个的话，跑一轮就留一堆临时目录。
+const scratchRoot = mkdtempSync(join(tmpdir(), "wf-tools-test-"));
+const scratchDirs: string[] = [scratchRoot];
+
+/** 数临时目录里还剩几个任务日志目录。 */
+function countTaskLogDirs(): number {
+	return readdirSync(tmpdir()).filter((name) => name.startsWith("workflow-tools-logs-")).length;
+}
+
+/** 建一个用完要清的临时目录；跑完统一收，失败路径也不留。 */
+function scratch(prefix: string): string {
+	const dir = mkdtempSync(join(tmpdir(), `${prefix}-`));
+	scratchDirs.push(dir);
+	return dir;
+}
+
+after(() => {
+	for (const dir of scratchDirs) rmSync(dir, { recursive: true, force: true });
+});
+
 function makeCtx(mode: "tui" | "rpc" | "json", ui: Record<string, unknown> = {}) {
-	const cwd = mkdtempSync(join(tmpdir(), "wf-tools-test-"));
+	const cwd = scratchRoot;
 	const ctx = {
 		mode,
 		hasUI: mode === "tui" || mode === "rpc",
@@ -602,6 +622,28 @@ test("显式参数覆盖父会话", () => {
 	});
 });
 
+test("显式参数压过 agent 文件里的 model —— 三级链的中间一级", () => {
+	const ctx = makeCtx("json");
+	// 少了这条，「显式参数 > agent 文件」这层就没人守：把实现里的两个操作数对调也全绿
+	assert.deepEqual(resolveDispatch(agent({ model: "anthropic/claude-opus-5-5" }), { model: "openai/gpt-5" }, ctx), {
+		model: "openai/gpt-5",
+	});
+});
+
+test("resolveDispatch 的结果真能拼进子 Pi 命令行", () => {
+	const ctx = makeCtx("json");
+	const args = buildChildArgs({
+		agent: agent(),
+		task: "t",
+		...resolveDispatch(agent(), { thinking_level: "high" }, ctx),
+	});
+
+	assert.ok(args.includes("--model"), `命令行里该有 --model，实际：${args.join(" ")}`);
+	assert.equal(args[args.indexOf("--model") + 1], "anthropic/claude-haiku-5-5");
+	assert.ok(args.includes("--thinking"));
+	assert.equal(args[args.indexOf("--thinking") + 1], "high");
+});
+
 test("agent 文件里的 model 优先于父会话，且此时不再继承思考档", () => {
 	const ctx = makeCtx("json");
 	// thinking 是父模型调的档，换了模型就不该照搬
@@ -628,15 +670,17 @@ test("父会话没有模型时不硬塞 --model，交给子 Pi 自己选", () =>
 test("取消会连孙进程一起收掉，不留孤儿", async () => {
 	const { pi, tools } = makePi();
 	plugin(pi);
-	const marker = join(mkdtempSync(join(tmpdir(), "wf-pg-")), "child.pid");
+	const marker = join(scratch("wf-pg"), "child.pid");
 	const ctx = makeCtx("json");
 
 	const started = await tools.get("monitor")!.execute(
 		"c",
 		{
 			description: "带孙进程",
-			// sh 是进程组组长，后台的 sleep 是它的子进程 —— 只杀直接子进程时它会活下来
-			command: `sleep 30 & echo $! > ${marker}; wait`,
+			// sh 是进程组组长，后台的 sleep 是它的子进程 —— 只杀直接子进程时它会活下来。
+			// 时长要远大于整个测试的墙钟，否则「它自己跑完了」会被误判成「被杀掉了」。
+			// 路径加引号：TMPDIR 里可能有空格或 shell 元字符。
+			command: `sleep 600 & echo $! > '${marker}'; wait`,
 		},
 		undefined,
 		undefined,
@@ -644,24 +688,34 @@ test("取消会连孙进程一起收掉，不留孤儿", async () => {
 	);
 	const taskId = (started.details as { taskId: string }).taskId;
 
-	for (let i = 0; i < 100 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 50));
+	// 前置条件给足预算：机器卡的时候不该红得和产品无关
+	for (let i = 0; i < 200 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 50));
 	assert.ok(existsSync(marker), "孙进程没起来，测试前提不成立");
 	const childPid = Number(readFileSync(marker, "utf8").trim());
 	assert.ok(Number.isFinite(childPid) && childPid > 0, `读到的 pid 不合法：${childPid}`);
 
-	await tools.get("task_stop")!.execute("c", { task_id: taskId }, undefined, undefined, ctx);
+	try {
+		await tools.get("task_stop")!.execute("c", { task_id: taskId }, undefined, undefined, ctx);
 
-	let alive = true;
-	for (let i = 0; i < 100; i++) {
+		let alive = true;
+		for (let i = 0; i < 100; i++) {
+			try {
+				process.kill(childPid, 0);
+				await new Promise((r) => setTimeout(r, 50));
+			} catch {
+				alive = false;
+				break;
+			}
+		}
+		assert.equal(alive, false, `孙进程 ${childPid} 还活着 —— 说明只杀了直接子进程`);
+	} finally {
+		// 断言失败时别把这个 sleep 留在机器上跑满 10 分钟
 		try {
-			process.kill(childPid, 0);
-			await new Promise((r) => setTimeout(r, 50));
+			process.kill(childPid, "SIGKILL");
 		} catch {
-			alive = false;
-			break;
+			// 已经没了
 		}
 	}
-	assert.equal(alive, false, `孙进程 ${childPid} 还活着 —— 说明只杀了直接子进程`);
 });
 
 // —— 收尾 ——
@@ -690,6 +744,23 @@ test("session_shutdown 会把存活任务收掉，不留下跑着的子进程", 
 	// 旧任务已经不在注册表里了
 	const stopped = await tools.get("task_stop")!.execute("c", { task_id: taskId }, undefined, undefined, ctx);
 	assert.equal(stopped.isError, true, "旧运行时已作废，旧 taskId 不再可停");
+});
+
+test("session_shutdown 会把日志目录收掉，不在临时目录里越积越多", async () => {
+	const { pi, tools, handlers } = makePi();
+	plugin(pi);
+	const ctx = makeCtx("json");
+	const shutdown = () => handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+
+	// 先归一化：本文件前面的测试可能已经建过日志目录
+	await shutdown();
+	const before = countTaskLogDirs();
+
+	await tools.get("monitor")!.execute("c", { description: "写日志", command: "echo hi" }, undefined, undefined, ctx);
+	assert.ok(countTaskLogDirs() > before, "跑任务该建出日志目录");
+
+	await shutdown();
+	assert.equal(countTaskLogDirs(), before, "收尾后不该还留着日志目录");
 });
 
 test("session_shutdown 之后新会话拿到全新运行时，照常接活", async () => {
