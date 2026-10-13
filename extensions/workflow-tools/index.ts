@@ -96,7 +96,8 @@ export default function (pi: ExtensionAPI) {
 			name: "ask_user_question",
 			label: "Ask user question",
 			description:
-				"向用户提 1～4 个结构化选择题并拿到答案。需要用户拍板时用它，别用普通文本提问。每题必须给一个 id，答案以 id 为 key。",
+				"向用户提 1～4 个结构化选择题并拿到答案。需要用户拍板时用它，别用普通文本提问。每题必须给一个 id，答案以 id 为 key。" +
+				"摆 spec-flow 审核档位卡时，调用方要把「文档检查：绿 / 红+摘要 / 无入口」和「N 份 × 该档 = X 个 agent / Y 分钟」两行写进相关问题的 description——卡片不会替你补。",
 			parameters: Type.Object({
 				questions: Type.Array(
 					Type.Object({

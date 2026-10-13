@@ -107,11 +107,23 @@ model: claude-opus-5-5
 审核档位的卡片、reviewer 的派出与结果回收可以直接表达成工具调用：
 
 ```
-ask_user_question        → 摆出审核档位卡（卡上带「文档检查」行与份数账）
+ask_user_question                  → 摆出审核档位卡
 subagent(run_in_background: true)  → 派 reviewer；完成后运行时自动推一条终态把主会话叫醒
 ```
 
 档位语义的唯一真相源是外部 spec-flow skill，插件只负责展示和回传。**插件不自动派 reviewer**——派发与裁决始终是用户和主 agent 的事。
+
+⚠️ 插件**不强制**卡上必须有「文档检查」行和份数账行，也不认识「这是不是一张闸卡」——那两行要由**主 agent 写进问题的 `description` 里**。别以为摆个卡就自动合规了。
+
+### 工具参数速查
+
+`ask_user_question`：`questions[]`，每题 `{ id, question, header(≤12 字), multiSelect, options[2..4] }`；选项 `{ label, description?, preview? }`。`id` 必填且题内唯一——答案以它作 key。`Other` 由卡片自动提供，别自己加。
+
+`monitor`：`{ description, command? , task_id?, timeout_ms?, deliver? }`。`command` 与 `task_id` 二选一。`timeout_ms` 默认 300000、最大 1800000、`0` 表示持续，**只对 `command` 有效**。`deliver` 默认 `"digest"`（30 秒窗口合并），传 `"terminal"` 则进度完全不进上下文。
+
+`subagent`：三种互斥形态——`{ agent, task, ... }`、`{ tasks: [...] }`（≤8 个）、`{ chain: [...] }`。可选 `cwd` / `run_in_background` / `model` / `thinking_level` / `isolation`（`"none"` \| `"worktree"`）/ `agentScope`（`"user"` 默认 \| `"project"` \| `"both"`）/ `confirmProjectAgents`。
+
+`task_stop`：`{ task_id }`。传已终态或不存在 id 都会拿到可识别结果，不报错。
 
 ## 发布（可选）
 
