@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createTaskRegistry, createConcurrencyGate, createDelivery, createTaskRuntime, truncateLine, LineRing } from "./task-runtime.ts";
+import { createTaskRegistry, createConcurrencyGate, createDelivery, createTaskRuntime, oneLine, truncateLine, LineRing } from "./task-runtime.ts";
 
 // —— 接线层的测试替身 ——
 
@@ -589,4 +589,38 @@ test("可量化验收：10 万行输出在 terminal 档只产生 1 条上下文�
 	d.flush();
 	// 进度 0 条；终态由运行时必推 1 条，不经过 delivery
 	assert.equal(d.messages().length, 0);
+});
+
+// —— oneLine：给「外部文本」（工具参数、任务描述）拼消息时的公共压行 / 截断 ——
+
+/** 孤立代理 = 一个 emoji 被切成半个；写进日志就是 U+FFFD 乱码。 */
+function hasLoneSurrogate(text: string): boolean {
+	return /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text);
+}
+
+test("上限截断不切歪代理对：第 199 个 code unit 正好落在 emoji 中间", () => {
+	const line = oneLine("🙂".repeat(150));
+	assert.ok(line.length <= 200, `行超宽：${line.length}`);
+	assert.ok(!hasLoneSurrogate(line), "切出了孤立代理");
+	assert.equal(line.indexOf("\uFFFD"), -1, "UTF-8 里会出现替换符");
+});
+
+test("预切那一刀也不切歪代理对（1600 code unit 处正好是 emoji 前半）", () => {
+	const line = oneLine(`${"a".repeat(1599)}🙂${"b".repeat(50)}`);
+	assert.ok(line.length <= 200, `行超宽：${line.length}`);
+	assert.ok(!hasLoneSurrogate(line), "预切切出了孤立代理");
+});
+
+test("终态消息头也压成一行并按上限截断：description 来自工具参数", () => {
+	const { runtime, pushed } = makeRuntime();
+	const begun = runtime.begin({ kind: "monitor", description: `第一行\n${"x".repeat(500)}`, deliver: "digest" });
+	if (!begun.ok) return;
+
+	runtime.finish(begun.task.id, "completed");
+
+	// 此时环形缓冲是空的 → 整条终态消息就是一个头，行数即头的行数
+	const text = pushed[0]?.text ?? "";
+	assert.equal(text.split("\n").length, 1, "description 里的换行必须被压掉，否则头被劈成多行");
+	assert.ok(text.startsWith(`任务 ${begun.task.id}（monitor）completed：第一行`), `实际：${text}`);
+	assert.ok(text.length <= 200, `头超宽：${text.length}`);
 });

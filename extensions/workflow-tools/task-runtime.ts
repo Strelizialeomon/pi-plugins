@@ -243,6 +243,31 @@ export function createConcurrencyGate(limits: { maxTasks: number; maxRunning: nu
 
 const TRUNCATION_MARKER = "…[truncated]";
 
+/** 一行摘要的宽度上限：消息头与子会话事件共用同一条线。 */
+export const ONE_LINE_MAX = 200;
+/** 折叠空白前先粗切一刀，把正则的工作量封在这里头。 */
+const ONE_LINE_SOURCE_MAX = ONE_LINE_MAX * 8;
+
+/**
+ * 按 code point 切，别落在代理对中间：切开一个 emoji 会留下孤立高代理，
+ * 写进日志就是 U+FFFD。只在超长行上出现，肉眼很难联想到是截断切歪了。
+ */
+function sliceSafe(text: string, max: number): string {
+	const cut = text.slice(0, max);
+	const last = cut.charCodeAt(cut.length - 1);
+	return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+}
+
+/**
+ * 压成一行并按上限截断。给工具参数、任务描述这类「外部文本」拼消息时用。
+ * `prefix` 也算在宽度里——否则前缀一长，整行照样撑破。
+ */
+export function oneLine(text: string, prefix = ""): string {
+	const source = text.length > ONE_LINE_SOURCE_MAX ? sliceSafe(text, ONE_LINE_SOURCE_MAX) : text;
+	const collapsed = `${prefix}${source}`.replace(/\s+/g, " ").trim();
+	return collapsed.length > ONE_LINE_MAX ? `${sliceSafe(collapsed, ONE_LINE_MAX - 1)}…` : collapsed;
+}
+
 export function truncateLine(line: string, max: number): string {
 	if (line.length <= max) return line;
 	if (max <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, max);
@@ -468,7 +493,8 @@ export function createTaskRuntime(options: {
 
 	function terminalText(task: RunningTask, status: TerminalStatus, logPath?: string): string {
 		const tail = task.ring.toArray().slice(-5);
-		const head = `任务 ${task.id}（${task.kind}）${status}：${task.record.description}`;
+		// description 来自工具参数：带换行会把头劈成好几行，过长会每条终态都灌一遍
+		const head = oneLine(task.record.description, `任务 ${task.id}（${task.kind}）${status}：`);
 		const body = tail.length > 0 ? `${head}\n最后几行：\n${tail.join("\n")}` : head;
 		return logPath ? `${body}\n完整日志：${logPath}` : body;
 	}

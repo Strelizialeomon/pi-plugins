@@ -12,7 +12,7 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { TaskProcess } from "./task-runtime.ts";
+import { oneLine, type TaskProcess } from "./task-runtime.ts";
 
 export type AgentSource = "user" | "project";
 export type AgentScope = "user" | "project" | "both";
@@ -310,28 +310,6 @@ function firstTextPart(content: unknown): string | undefined {
 		}
 	}
 	return undefined;
-}
-
-/** 一行摘要的宽度上限：终态消息只展示最后几行，一行几十字就够。 */
-const CHILD_LINE_MAX = 200;
-/** 折叠空白前先粗切一刀，把正则的工作量封在这里头。 */
-const CHILD_SOURCE_MAX = CHILD_LINE_MAX * 8;
-
-/**
- * 按 code point 切，别落在代理对中间：切开一个 emoji 会留下孤立高代理，
- * 写进日志就是 U+FFFD。只在超长行上出现，肉眼很难联想到是截断切歪了。
- */
-function sliceSafe(text: string, max: number): string {
-	const cut = text.slice(0, max);
-	const last = cut.charCodeAt(cut.length - 1);
-	return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
-}
-
-/** 压成一行并按上限截断。`prefix` 也算在宽度里——否则前缀一长，整行照样撑破。 */
-export function oneLine(text: string, prefix = ""): string {
-	const source = text.length > CHILD_SOURCE_MAX ? sliceSafe(text, CHILD_SOURCE_MAX) : text;
-	const collapsed = `${prefix}${source}`.replace(/\s+/g, " ").trim();
-	return collapsed.length > CHILD_LINE_MAX ? `${sliceSafe(collapsed, CHILD_LINE_MAX - 1)}…` : collapsed;
 }
 
 function previewArgs(args: unknown): string | undefined {

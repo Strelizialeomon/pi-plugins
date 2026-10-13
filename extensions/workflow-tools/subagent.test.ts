@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { oneLine } from "./task-runtime.ts";
 import {
 	createIsolatedWorktree,
 	releaseWorktree,
@@ -12,7 +13,6 @@ import {
 	describeChildEvent,
 	flushChildTail,
 	isFailedChild,
-	oneLine,
 	needsProjectTrust,
 	parseAgentFile,
 	parseJsonLines,
@@ -449,19 +449,6 @@ test("内部事件名不进缓冲：这些事件一律不翻译", () => {
 function hasLoneSurrogate(text: string): boolean {
 	return /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text);
 }
-
-test("上限截断不切歪代理对：第 199 个 code unit 正好落在 emoji 中间", () => {
-	const line = oneLine("🙂".repeat(150));
-	assert.ok(line.length <= 200, `行超宽：${line.length}`);
-	assert.ok(!hasLoneSurrogate(line), "切出了孤立代理");
-	assert.equal(line.indexOf("\uFFFD"), -1, "UTF-8 里会出现替换符");
-});
-
-test("预切那一刀也不切歪代理对（1600 code unit 处正好是 emoji 前半）", () => {
-	const line = oneLine(`${"a".repeat(1599)}🙂${"b".repeat(50)}`);
-	assert.ok(line.length <= 200, `行超宽：${line.length}`);
-	assert.ok(!hasLoneSurrogate(line), "预切切出了孤立代理");
-});
 
 test("emoji 参数走完整链路也不变乱码，且行宽守住", () => {
 	const line = describeChildEvent({

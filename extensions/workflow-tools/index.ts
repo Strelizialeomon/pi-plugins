@@ -20,7 +20,6 @@ import {
 	discoverAgents,
 	isFailedChild,
 	needsProjectTrust,
-	oneLine,
 	releaseWorktree,
 	startChildPi,
 	type AgentDefinition,
@@ -29,6 +28,7 @@ import {
 } from "./subagent.ts";
 import {
 	createTaskRuntime,
+	oneLine,
 	type LogSink,
 	type RunningTask,
 	type RuntimeSink,
