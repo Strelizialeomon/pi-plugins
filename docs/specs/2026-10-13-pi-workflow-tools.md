@@ -207,8 +207,8 @@ WebSocket、远程任务和任务恢复保留为后续扩展点，不进入本�
 - 没有显式覆盖时继承父会话当前 provider/model/thinking level；
 - agent 的系统提示写入权限为 600 的临时文件，通过 `--append-system-prompt` 传给子 Pi，任务结束后删除；
 - `run_in_background: false` 时工具等待子会话完成并返回结果；
-- `run_in_background: true` 时立即返回 `taskId`；子会话完成后由**任务运行时**统一发一条终态（`triggerTurn: true`），`subagent` 自身不再另推一条；
-- 并发上限按**会话级**计：同一会话内并行 subagent 最多 8 个任务，其中同时运行最多 4 个；超出并发槽的任务排队，并在结果里报告排位；一次调用本身就要超过 8 个任务时直接返回 `concurrency_exceeded`。任一任务失败不取消其他任务，最终结果逐任务报告；
+- `run_in_background: true` 时返回 `taskId`（**满并发槽时例外**：先在闸上等空槽、拿到名额再返回，等待期间这次工具调用是阻塞的）；子会话完成后由**任务运行时**统一发一条终态（`triggerTurn: true`），`subagent` 自身不再另推一条；
+- 并发上限按**会话级**计：同一会话内**所有任务（monitor 与 subagent 合计）最多 8 个**；单次超过 8 个的闸只加在并行 `tasks` 上（`chain` 逐步串行，不受此限）。「同时最多 4 个在运行」只用于给 **subagent** 排队：它要新起子 Pi 进程，满槽的 subagent 等空槽（`position` 目前不进返回值）；**monitor 不等空槽，但有空槽时会占用这个计数**——4 个常驻 monitor 会把后续 subagent 顶在队列里。任一任务失败不取消其他任务，最终结果逐任务报告；
 - 链式任务按顺序执行，前一步的最终文本通过 `{previous}` 注入下一步；中间步骤失败时停止后续步骤；
 - `isolation: "worktree"` 只在显式请求时创建独立 worktree，并在结果中返回路径；存在未提交改动时不得自动删除 worktree；
 - Ctrl+C 或工具信号取消时，向子 Pi 所在的**独立进程组**发送 SIGTERM，5 秒后仍未退出再对整个进程组发送 SIGKILL；
@@ -256,7 +256,7 @@ interface WorkflowTask {
 
 - 原子生成任务 ID；
 - 查询、追加事件、结束和停止；
-- 每任务独立 AbortController，以及**会话级**并发信号量（同时最多 8 个任务、4 个在运行）；
+- 每任务独立 AbortController，以及**会话级**并发信号量：任务总数上限 8（monitor 与 subagent 合计）；「同时最多 4 个在运行」只给 subagent 排队（monitor 不等空槽，但有空槽时会占用该计数）；
 - 环形输出缓冲和完整日志文件；
 - `task_id` 到 monitor / subagent 的事件订阅；订阅已终态任务时立即回放终态快照并标记 `alreadyFinished: true`，不新建订阅；
 - **终态唯一发送点**：每个任务从运行态转入终态时恰好发一条终态事件（`triggerTurn: true`），重复的 close、abort、timeout 必须幂等，订阅者不产生第二条；
@@ -347,7 +347,7 @@ README 需要增加安装、启用、工具参数和 spec-flow 使用示例。�
 - [ ] 子会话默认继承父模型和 thinking level，显式参数可以覆盖；
 - [ ] 可配置 agent system prompt 和工具集合（agent 文件本身不提供 thinking level，该值只能来自参数或继承）；
 - [ ] 项目级 agent 默认不生效：不传 `agentScope` 时 `<repo>/.pi/agents/*.md` 里的 agent 不参与；传 `agentScope: "project"` 且 `confirmProjectAgents` 缺省时先过信任确认；
-- [ ] 并发上限是会话级：一条消息里发两个 `subagent(tasks: [8])`，第二个调用按会话信号量受限，不会起满 8 个进程；单次调用超过 8 个任务返回 `concurrency_exceeded`；
+- [ ] 并发上限是会话级：一条消息里发两个 `subagent(tasks: [8])`，第二个调用按会话信号量受限，不会起满 8 个进程；并行 `tasks` 单次超过 8 个返回 `concurrency_exceeded`；monitor 起完立即返回 `taskId`、不等空槽，但**有空槽时会占用运行位**（4 个常驻 monitor 会顶住后续 subagent）；
 - [ ] 链式模式把 `{previous}` 替换为前一步结果，失败时停止后续；
 - [ ] 后台模式立即返回任务 ID，完成后由运行时推一条终态通知主会话；
 - [ ] 取消能终止子 Pi 所在的整个进程组，`pgrep` 查不到孤儿进程；
@@ -366,7 +366,7 @@ README 需要增加安装、启用、工具参数和 spec-flow 使用示例。�
 
 | 机制 | 解决什么 | 没有它会怎样 |
 |---|---|---|
-| TaskRuntime | 统一管理 monitor 和 subagent 的 ID、状态、取消、清理和**会话级并发信号量**；是终态的唯一发送点 | 两种后台任务各自维护生命周期，容易重复通知和泄漏进程 |
+| TaskRuntime | 统一管理 monitor 和 subagent 的 ID、状态、取消、清理和**会话级并发信号量**（8 个任务合计；4-running 只约束 subagent）；是终态的唯一发送点 | 两种后台任务各自维护生命周期，容易重复通知和泄漏进程 |
 | Push bridge | 用 `triggerTurn: true` 把终态主动送回主会话（会话空闲也唤醒），而不是只 append 进队列 | 主模型只能轮询，长任务会占住回合或丢失完成通知 |
 | Delivery digest | 进度事件按 30 秒窗口合并；`deliver: "terminal"` 可完全关掉进度投递 | 每秒多行的日志会生成等量模型消息，上下文和回合数爆炸 |
 | Context guard | 环形缓冲（200 行）+ 单行截断（4096 字符）限制缓冲与回放量 | 长任务日志无上限增长，查询时一次性撑大上下文 |
@@ -390,7 +390,7 @@ README 需要增加安装、启用、工具参数和 spec-flow 使用示例。�
 7. monitor 默认超时 5 分钟，最大 30 分钟；`timeout_ms: 0` 表示持续任务。该参数**只对 `command` 模式有效**，`task_id` 订阅不受它约束——这正是「默认 5 分钟超时早于 10 分钟重审」那个坑的解。
 8. 进上下文的投递：终态恒推一条且带 `triggerTurn: true`；`deliver` 默认 `"digest"`，进度事件按 30 秒窗口合并；`deliver: "terminal"` 时进度完全不进上下文。
 9. monitor 环形缓冲保存最近 200 行，单行进入上下文最多 4096 字符。
-10. 并行 subagent 上限按**会话级**计：同时最多 8 个任务、4 个在运行；超出并发槽的任务排队并在结果里报告排位，单次调用超过 8 个任务返回 `concurrency_exceeded`。
+10. 并发上限按**会话级**计：任务总数最多 8（monitor 与 subagent 合计）。「同时最多 4 个在运行」只给 subagent 排队，满槽的 subagent 等空槽（排位不进返回值）；monitor 不等空槽，但有空槽时会占用该计数——4 个常驻 monitor 会顶住后续 subagent。单次超过 8 个的闸只加在并行 `tasks` 上（`chain` 逐步串行）。
 11. subagent 默认继承父会话的 provider、model 和 thinking level；只有显式参数才覆盖。agent 文件格式本身不含 thinking level 字段。
 12. 项目级 agent 位于 `<repo>/.pi/agents/*.md`，默认不启用（`agentScope` 缺省为 `"user"`）；启用须通过 Pi 的项目可信判断，`confirmProjectAgents` 默认 `true`。
 13. `isolation: "worktree"` 只由调用方显式开启；任务结束时不自动删除有未提交改动的 worktree。
@@ -423,7 +423,7 @@ README 需要增加安装、启用、工具参数和 spec-flow 使用示例。�
 | 10 | 中 | 闸卡模板缺「文档检查」行与份数账；四档语义被复制进插件会漂；Pi 侧没有 spec-flow skill | 已改：§6.1 改为只固定展示形态、语义以外部 skill 为唯一真相源，两行列为必填；§8.1 改为人工比对 |
 | 11 | 中 | 只 kill 直接子进程，孙进程逃过清理 | 已改：独立进程组加整组信号，§4.2 / §4.3 / §4.4 / §5 同步，§8.2 / §8.3 改为 `pgrep` 可数判定 |
 | 12 | 中 | spawn 途中 shutdown 会漏掉未登记的进程；迟到的推送会写进已被替换的旧会话 | 已改：§5 写入 `shuttingDown` 收尾顺序（拒绝新 spawn、await 进程退出、丢弃迟到推送），§8.2 加验收 |
-| 13 | 中 | 并发上限 8 / 4 未说明是每次调用还是整会话，超限行为也未定义 | 已改：锚到会话级信号量，超出排队并报告排位，单次超过 8 个返回 `concurrency_exceeded` |
+| 13 | 中 | 并发上限 8 / 4 未说明是每次调用还是整会话，超限行为也未定义 | 已改：锚到会话级信号量，超出排队并报告排位，单次超过 8 个返回 `concurrency_exceeded`（实施后更正：排位未进返回值；monitor 不等空槽但有空槽时会占用 4-running；单次上限只加在并行 `tasks`，`chain` 无此限——见 §11 口径澄清） |
 | 14 | 中 | 版本基线写成 Pi 1.1.x，仓库实际是 1.2.0 | 已改：§1 改为 1.2.x |
 | 15 | 中 | 断言 follow-up 队列能主动通知主会话，与 Pi 投递语义不符 | 与 #1 同一根因，同一处处置 |
 | 16 | 中 | agent 定义被写成提供「可选 thinking level」，Pi agent 格式没有该字段 | 已改：§4.3 与 §8.3 写明该值只能来自调用参数或父会话继承 |
@@ -431,3 +431,13 @@ README 需要增加安装、启用、工具参数和 spec-flow 使用示例。�
 | 附 | 轻 | `task_stop` 传入不存在或已终态的 `id` 行为未定义（原列轻档，与 #3 属同一判据） | 已改：§4.4 一并定义 |
 
 轻档还剩 4 条本轮未动，留待实施期处理：`isolation` 只存在于单个模式（与 §9 Worktree guard 的适用范围不匹配）、子进程未带 `-ne/-nc/--no-mcp` 等资源开关（子会话的“独立上下文”并不彻底）、`outputFile` 的落点与保留期未定义且命名风格 snake / camel 混用、§7 落点清单缺 TypeBox（工具 schema 必需，仓库未声明）。
+
+### 口径澄清（实施后真机测试发现）
+
+上表第 13 条的「锚到会话级信号量」写得含糊，实施与真机测试暴露出两种读法。现明确，并同步 §4.3 / §5 / §8.3 / §9 / §10.10：
+
+- **8 个任务**是会话级的，monitor 与 subagent **合计**；单次超过 8 个的闸只加在并行 `tasks` 上（`chain` 逐步串行，无此限制）；
+- **「同时最多 4 个在运行」只用于给 subagent 排队** —— 它要新起子 Pi 进程，满槽就等空槽（`position` 不进返回值）；
+- **monitor 不等空槽，但有空槽时会占用这个计数** —— 闸只看「有没有空槽」，不看任务种类；4 个常驻 monitor（`timeout_ms: 0`）会把后续 subagent 顶在队列里，直到有 monitor 结束释放。
+
+真机实测：同时 7 个 `sleep` 存活、第 9 个任务被拒——前者正是「monitor 不等空槽、起完立即返回」与「它会占用空闲运行位」并存的表现。复现（本仓 `task-runtime.ts`）：连开 4 个 monitor 式 `enter()` 后 `running() === 4`，第 5 个 `enter()` 拿到 `position = 1`，`ready` 直到某个 monitor `release()` 才落定。

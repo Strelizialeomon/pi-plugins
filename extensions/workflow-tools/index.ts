@@ -452,7 +452,8 @@ function releaseTaskLogs() {
 }
 
 /**
- * 并发排队：超过 4 个在跑的任务要等空槽，不能直接 spawn。
+ * 并发排队：subagent 超过 4 个在跑的要等空槽，不能直接 spawn。
+ * monitor 不走这条路——它不等空槽，但有空槽时同样会占一个运行位。
  * 等的时候任务可能已经被取消，返回 false 表示别再往下走了。
  */
 async function waitForSlot(task: RunningTask, ready: Promise<void>, signal?: AbortSignal): Promise<boolean> {
@@ -484,7 +485,7 @@ function normalizeTimeout(value: number | undefined): number {
 
 function beginFailureText(reason: "concurrency_exceeded" | "shutting_down"): string {
 	return reason === "concurrency_exceeded"
-		? "并发已满：同一会话最多 8 个任务、4 个在运行。等前面的跑完再试。"
+		? "并发已满：同一会话最多 8 个任务（monitor 与 subagent 合计）。等前面的任务结束再试。"
 		: "会话正在收尾，这时不再接受新任务。";
 }
 
@@ -622,7 +623,7 @@ async function runOne(input: RunContext & { agentName: string; taskText: string 
 	const task = begun.task;
 	const startedAt = Date.now();
 
-	// 排队：第 5 个起的任务要等空槽，不能直接 spawn
+	// 排队：第 5 个起的 subagent 要等空槽，不能直接 spawn
 	if (!(await waitForSlot(task, begun.ready, input.signal))) {
 		input.tasks.finish(task.id, "stopped");
 		return fail("任务在排队期间被取消。", { kind: "cancelled" });
