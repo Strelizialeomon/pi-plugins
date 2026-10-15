@@ -617,3 +617,55 @@ test("终端把按键编成 modifyOtherKeys 时，Other 行照样收得到", asy
 	const outcome = (await card.result) as { responses?: Record<string, string> };
 	assert.equal(outcome.responses?.q, "a");
 });
+
+// —— 对抗式审核抓到的回归（每条对着一个具体复现路径） ——
+
+test("多选：把 Other 正文删空即取消，答案里不再有它", async (t) => {
+	const questions = [question({ id: "a", header: "甲", multiSelect: true }), question({ id: "b", header: "乙", question: "第二题" })];
+	const card = harness(t, questions, 24, 80);
+	card.input(DOWN, DOWN);
+	card.input("补", "充", ENTER); // 采用 → 推进到第二题
+	card.input(BACK_TAB); // 回第一题（焦点仍在 Other 行）
+	card.input("\x7f", "\x7f"); // 把正文删空——注意全程不再按 Enter 落在 Other 行上：
+	// 这里要验的正是「删空本身就该取消」，而不是「按 Enter 时被顺手清掉」。
+	card.input("\x1b[A", "\x1b[A", " "); // 离开 Other 行 → 勾上 A
+	card.input(ENTER, ENTER, ENTER); // 确认 → 提交屏 → 提交
+	const outcome = (await card.result) as { answers: Record<string, string>; responses?: Record<string, string> };
+	assert.deepEqual(outcome.answers, { a: "A", b: "A" });
+	assert.equal(outcome.responses, undefined, "删空的 Other 不能留在答案里");
+});
+
+test("宿主抢过焦点再还回来，行内编辑器仍把光标行显示出来", (t) => {
+	const card = harness(t, [question()], 24, 40);
+	card.input(DOWN, DOWN);
+	const component = card.component();
+	component.focused = false;
+	assert.ok(!component.render(40).join("\n").includes(CURSOR_MARKER), "失焦时不该占着硬件光标");
+	component.focused = true;
+	card.input("头", "x".repeat(200), "尾");
+	const raw = component.render(40).join("\n");
+	assert.ok(raw.includes(CURSOR_MARKER), "回到焦点后光标要回来");
+	assert.ok(raw.includes("尾"), "开窗该跟着光标走到末尾");
+});
+
+test("宿主把确认键改绑后，Enter 不再清空 Other 正文", async (t) => {
+	const keys = new KeybindingsManager(TUI_KEYBINDINGS, { "tui.select.confirm": "ctrl+y" });
+	const card = harness(t, [question()], 24, 80, keys);
+	card.input(DOWN, DOWN, "重要内容");
+	card.input(ENTER);
+	assert.ok(card.plain().includes("重要内容"), "Enter 已不是确认键，就不该动正文");
+	card.input("\x19"); // Ctrl+Y
+	const outcome = (await card.result) as { responses?: Record<string, string> };
+	assert.equal(outcome.responses?.q, "重要内容");
+});
+
+test("极窄终端下 Other 行不崩也不溢出", async (t) => {
+	for (const columns of [12, 14, 20]) {
+		const card = harness(t, [question()], 24, columns);
+		card.input(DOWN, DOWN, "中文😀x");
+		for (const line of card.component().render(columns)) {
+			assert.ok(visibleWidth(line) <= columns, `${columns} 列溢出：${JSON.stringify(line)}`);
+		}
+		await card.close();
+	}
+});

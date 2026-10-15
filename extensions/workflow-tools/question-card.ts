@@ -38,7 +38,7 @@ export interface Pick {
 	/** 走 `Other` 自由输入时的原文。 */
 	other?: string;
 	notes?: string;
-	/** RPC 下降级过（多选被拆成连续单选、preview 丢弃）。 */
+	/** RPC 下降级过（多选被拆成连续单选）。 */
 	degraded?: boolean;
 }
 
@@ -203,7 +203,7 @@ const RESERVED_LABELS = [OTHER_LABEL, CHAT_LABEL, DONE_LABEL, CANCEL_LABEL];
 let cardOpen = false;
 
 /**
- * RPC 只有单值 select，多选按题拆成连续单选，preview 丢弃并标 degraded。
+ * RPC 只有单值 select，多选按题拆成连续单选，并在结果里标 degraded。
  * `opts.signal` 必须传：客户端崩了或不回包时，只有 abort 能把 promise 落定，
  * 否则 `cardOpen` 会永久卡住，之后每次调用都返回 busy。
  */

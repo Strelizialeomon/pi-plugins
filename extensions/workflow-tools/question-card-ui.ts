@@ -148,6 +148,7 @@ export class QuestionCard implements Component, Focusable {
 	set focused(value: boolean) {
 		this.#focused = value;
 		if (this.#editor) this.#editor.focused = value;
+		if (this.#otherEd) this.#otherEd.focused = value;
 	}
 
 	#refresh(): void { this.#tui.requestRender(); }
@@ -307,6 +308,13 @@ export class QuestionCard implements Component, Focusable {
 			const editor = new FullTextEditor(this.#tui, this.#editorTheme());
 			editor.setText(this.#state().draft);
 			editor.focused = this.#focused;
+			// 宿主若把确认键改绑走了，Enter 会落到编辑器里触发提交——pi 的 submitValue
+			// 先清空正文再回调，所以这里必须把内容放回去，否则输入被静默吃掉。
+			editor.onSubmit = (value) => {
+				editor.setText(value);
+				this.#state().draft = value;
+				this.#refresh();
+			};
 			this.#otherEd = editor;
 		}
 		return this.#otherEd;
@@ -325,10 +333,19 @@ export class QuestionCard implements Component, Focusable {
 		const state = this.#state();
 		const value = (this.#otherEd?.getExpandedText() ?? state.draft).trim();
 		if (!value) {
+			state.other = undefined;
+			// 空输入没有可采用的正文：本题已有别的有效选择（多选）就当「确认已有选择」，
+			// 否则报错停下——不能让一段屏幕上已经看不见的旧正文留在答案里。
+			if (this.#valid(state)) {
+				this.#advance();
+				return;
+			}
 			this.#error = "请输入非空答案。";
 			this.#refresh();
 			return;
 		}
+		// 把裁掉边缘空白的正文也写回编辑器，免得随后 #dropOtherEditor 用未 trim 的原文覆盖草稿。
+		this.#otherEd?.setText(value);
 		state.draft = value;
 		state.other = value;
 		if (!this.#question().multiSelect) state.chosen.clear();
@@ -378,7 +395,10 @@ export class QuestionCard implements Component, Focusable {
 			}
 			const editor = this.#otherEditor();
 			editor.handleInput(data);
-			this.#state().draft = editor.getExpandedText();
+			const draft = editor.getExpandedText();
+			this.#state().draft = draft;
+			// 多选下 Other 是可独立取消的补充项：把正文删空就是取消它（§7.2）。
+			if (!draft.trim() && this.#state().other !== undefined) this.#state().other = undefined;
 			this.#refresh();
 			return;
 		}
@@ -443,7 +463,7 @@ export class QuestionCard implements Component, Focusable {
 	}
 
 	/**
-	 * 清洗外部原文（模型给的题目 / 标签 / 描述 / 预览，用户敲的 Other 与备注）：
+	 * 清洗外部原文（模型给的题目 / 标签 / 描述，用户敲的 Other 与备注）：
 	 * 先剥掉 ANSI 序列，再把剩下的控制字符压成空格——制表符在真终端里会撑乱列对齐，
 	 * 而裸 ESC 能让外部文本自己上色。
 	 * ⚠️ 只能在套主题色**之前**用；`#wrap` 收到的是已经上过色的串，那里不能做这件事。
@@ -561,9 +581,11 @@ export class QuestionCard implements Component, Focusable {
 			if (index === question.options.length) {
 				// Other 行本身就是输入框：文字直接接在 `Other: ` 后面，不弹边框编辑器。
 				const head = "Other: ";
-				if (focused) {
-					const indent = visibleWidth(prefix) + visibleWidth(head);
-					const all = this.#otherEditor().render(Math.max(1, width - indent)).slice(1, -1);
+				const indent = visibleWidth(prefix) + visibleWidth(head);
+				// 剩余宽度太窄就别上编辑器：pi 的折行遇到「字素比折行宽还宽」会自递归（RangeError），
+				// 而 `Math.max(1, …)` 的保底会让每行溢出 1 列。退回纯文本渲染，至少不崩不溢出。
+				if (focused && width - indent >= 4) {
+					const all = this.#otherEditor().render(width - indent).slice(1, -1);
 					// 长输入只显示光标附近的一段：把光标钉在窗口里，别让它跑出屏幕。
 					const budget = Math.max(1, Math.min(editorRows, VISIBLE_ITEMS));
 					const at = Math.max(0, all.findIndex((line) => line.includes(CURSOR_MARKER)));
@@ -572,7 +594,8 @@ export class QuestionCard implements Component, Focusable {
 					bucket.push(prefix + head + (lines[0] ?? ""), ...lines.slice(1).map((line) => " ".repeat(indent) + line));
 				} else {
 					const placeholder = question.multiSelect ? "Type something" : "Type something.";
-					const body = state.draft ? theme.fg("success", this.#clean(state.draft)) : theme.fg("dim", placeholder);
+					const adopted = Boolean(state.other);
+					const body = state.draft ? theme.fg(adopted ? "success" : "text", this.#clean(state.draft)) : theme.fg("dim", placeholder);
 					bucket.push(...this.#wrap(`${head}${body}`, width, prefix));
 				}
 				continue;
