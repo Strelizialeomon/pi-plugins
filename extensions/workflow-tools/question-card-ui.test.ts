@@ -475,3 +475,10 @@ test("Other 行空着时显示占位文案，采用后换成正文", async (t) =
 	assert.ok(adopted.plain().includes("自己写"), "采用后显示正文");
 	assert.ok(!adopted.plain().includes("Type something"), "采用后不该再显示占位");
 });
+
+test("空格落在 Chat 行上同样是「先聊」，不会把它当成一个选项", async (t) => {
+	const card = harness(t, [question()], 24, 80);
+	card.input(DOWN, DOWN, DOWN); // 走到 Chat 行
+	card.input(SPACE);
+	assert.deepEqual(await card.result, { kind: "chat" });
+});

@@ -249,6 +249,12 @@ export class QuestionCard implements Component, Focusable {
 	#toggle(): void {
 		const state = this.#state();
 		this.#error = "";
+		// Chat 行不是选项：空格与 Enter 一样，都是「先不选，聊两句」。
+		// 少了这条，空格会把它的下标当成普通项写进答案，取值时越界。
+		if (this.#isChat()) {
+			this.#finish({ kind: "chat" });
+			return;
+		}
 		if (this.#isOther()) {
 			if (this.#question().multiSelect && state.other) state.other = undefined;
 			else this.#edit("other");
