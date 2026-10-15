@@ -488,11 +488,12 @@ export class QuestionCard implements Component, Focusable {
 			const tick = !question.multiSelect && selected ? ` ${theme.fg("success", g.tick)}` : "";
 			const prefix = `${pointer} ${number} ${mark}`;
 			bucket.push(...this.#wrap(`${title}${tick}`, width, prefix));
+			const indent = " ".repeat(visibleWidth(prefix));
+			// Other 空着时用占位文案顶上（上游的 input 项也是这么表达的），采用后换成正文。
+			const placeholder = question.multiSelect ? "Type something" : "Type something.";
 			const description = other ? state.other : question.options[index]!.description;
-			if (description) {
-				const indent = " ".repeat(visibleWidth(prefix));
-				bucket.push(...this.#wrap(theme.fg(selected ? "success" : "muted", description), width, indent));
-			}
+			if (description) bucket.push(...this.#wrap(theme.fg(selected ? "success" : "muted", description), width, indent));
+			else if (other) bucket.push(...this.#wrap(theme.fg("dim", placeholder), width, indent));
 		}
 
 		if (this.#hasChat()) {

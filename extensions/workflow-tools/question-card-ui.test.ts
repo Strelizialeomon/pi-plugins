@@ -456,3 +456,22 @@ test("中文、emoji、组合字符、显式换行与无空格长 URL 都不溢�
 		await card.close();
 	}
 });
+
+test("Other 行空着时显示占位文案，采用后换成正文", async (t) => {
+	const single = harness(t, [question()], 24, 80);
+	assert.ok(single.plain().includes("Type something."), `单选占位：${single.plain()}`);
+	await single.close();
+
+	const multi = harness(t, [question({ multiSelect: true })], 24, 80);
+	assert.ok(multi.plain().includes("Type something"), "多选占位应存在");
+	assert.ok(!multi.plain().includes("Type something."), "多选占位不带句号");
+	await multi.close();
+
+	// 单题卡片采用 Other 就直接结束了，看不到列表——用两题卡回退着看。
+	const adopted = harness(t, [question({ id: "a", header: "甲" }), question({ id: "b", header: "乙" })], 24, 80);
+	adopted.input(DOWN, DOWN, ENTER);
+	adopted.input("自", "己", "写", ENTER); // 采用 → 推进到第二题
+	adopted.input(BACK_TAB); // 回第一题看列表
+	assert.ok(adopted.plain().includes("自己写"), "采用后显示正文");
+	assert.ok(!adopted.plain().includes("Type something"), "采用后不该再显示占位");
+});
