@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { CURSOR_MARKER, getKeybindings, KeybindingsManager, stripTerminalSequences, TuiAltScreen, TuiMainScreen, TUI_KEYBINDINGS, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { askQuestions, type CardOutcome, type QuestionSpec } from "./question-card.ts";
-import { FALLBACK_GLYPHS, pickGlyphs, UNICODE_GLYPHS, VISIBLE_ITEMS } from "./question-card-ui.ts";
+import { FALLBACK_GLYPHS, pickGlyphs, QuestionCard, UNICODE_GLYPHS, VISIBLE_ITEMS } from "./question-card-ui.ts";
+import type { PasteDeps } from "./clipboard-paste.ts";
 
 // 字形按终端能力二选一；本文件锁定 Unicode 档，能力判定本身另有专门用例。
 process.env.TERM = "xterm-256color";
@@ -668,4 +669,133 @@ test("极窄终端下 Other 行不崩也不溢出", async (t) => {
 		}
 		await card.close();
 	}
+});
+
+// —— Other 行从剪贴板粘贴（键位路由与插入；剪贴板本身用假的注入） ——
+
+const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2]);
+
+// pi-tui 自带的 `getKeybindings()` 只有 `tui.*`，不认 `app.clipboard.pasteImage`；
+// 生产里 Pi 注入的是应用那份键位表（`interactive-mode.js` 的 `factory(this.ui, theme, this.keybindings, close)`），
+// 所以这里要照它的样子造一份，否则测的就不是真实条件。
+const APP_PASTE_DEFINITION = { "app.clipboard.pasteImage": { defaultKeys: "ctrl+v", description: "Paste from clipboard" } };
+function appKeys(user: Record<string, string> = {}) {
+	return new KeybindingsManager({ ...TUI_KEYBINDINGS, ...APP_PASTE_DEFINITION } as never, user as never);
+}
+
+/** 直接建卡片，好把假剪贴板注进去（生产路径走 askQuestions，用默认的真实剪贴板）。 */
+function mountWithClipboard(t: TestContext, deps: PasteDeps, keybindings = appKeys(), questions: QuestionSpec[] = [question()]) {
+	let card!: QuestionCard;
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
+	const tui = { terminal: { rows: 24, columns: 80 }, requestRender() {} } as unknown as TUI;
+	const controller = new AbortController();
+	const settled = new Promise<void>((resolve) => { card = new QuestionCard(questions, tui, theme, keybindings, () => resolve(), controller.signal, UNICODE_GLYPHS, deps); });
+	t.after(async () => { controller.abort(); card.dispose?.(); await settled; });
+	const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+	return {
+		press: (...keys: string[]) => { for (const key of keys) card.handleInput!(key); },
+		plain: () => card.render(80).map(stripTerminalSequences).join("\n"),
+		tick,
+	};
+}
+
+test("Other 行按粘贴键：剪贴板里的图片落成临时文件，路径接进正文", async (t) => {
+	const written: string[] = [];
+	const card = mountWithClipboard(t, { reader: { async getImage() { return PNG_BYTES; } }, tmpDir: "/tmp/x", id: () => "abc", writeFile: (path) => written.push(path) });
+	card.press(DOWN, DOWN, "\x16"); // Ctrl+V
+	await card.tick();
+	assert.ok(card.plain().includes("Other: /tmp/x/pi-clipboard-abc.png"), `应插入临时文件路径：\n${card.plain()}`);
+	assert.deepEqual(written, ["/tmp/x/pi-clipboard-abc.png"]);
+});
+
+test("Other 行按粘贴键：剪贴板里是文本就插文本", async (t) => {
+	const card = mountWithClipboard(t, { reader: { async getText() { return "粘进来的字"; } } });
+	card.press(DOWN, DOWN, "\x16");
+	await card.tick();
+	assert.ok(card.plain().includes("Other: 粘进来的字"), card.plain());
+});
+
+test("焦点不在 Other 行时，粘贴键不接管（正文与卡片都不动）", async (t) => {
+	const card = mountWithClipboard(t, { reader: { async getText() { return "不该出现"; } } });
+	card.press("\x16"); // 焦点在第 1 项上
+	await card.tick();
+	assert.ok(!card.plain().includes("不该出现"), card.plain());
+	assert.ok(card.plain().includes("❯ 1. A"), "焦点不动");
+});
+
+test("粘贴键跟随宿主键位：改绑后旧键不触发、新键触发", async (t) => {
+	const card = mountWithClipboard(t, { reader: { async getText() { return "跟键位走"; } } }, appKeys({ "app.clipboard.pasteImage": "ctrl+g" }));
+	card.press(DOWN, DOWN, "\x16"); // 旧键
+	await card.tick();
+	assert.ok(!card.plain().includes("跟键位走"), "旧键不该再触发");
+	card.press("\x07"); // Ctrl+G
+	await card.tick();
+	assert.ok(card.plain().includes("Other: 跟键位走"), card.plain());
+});
+
+test("剪贴板为空时按粘贴键：不插入、不报错", async (t) => {
+	const card = mountWithClipboard(t, { reader: { async getText() { return null; } } });
+	card.press(DOWN, DOWN, "\x16");
+	await card.tick();
+	assert.ok(!card.plain().includes("请输入"), "不该报错");
+	assert.ok(card.plain().includes("❯ 3. Other:"), "正文保持为空");
+});
+
+test("粘贴途中切题：内容不会落到另一题头上", async (t) => {
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const questions = [question({ id: "a", header: "甲" }), question({ id: "b", header: "乙", question: "第二题" })];
+	const card = mountWithClipboard(t, { reader: { async getText() { await gate; return "/tmp/late.png"; } } }, appKeys(), questions);
+	card.press(DOWN, DOWN, "\x16"); // 在题一的 Other 行发起粘贴
+	card.press(TAB); // await 期间切到第二题
+	release();
+	await card.tick();
+	card.press(DOWN, DOWN); // 看第二题的 Other 行
+	assert.ok(!card.plain().includes("/tmp/late.png"), `内容不该落到第二题头上：\n${card.plain()}`);
+});
+
+test("粘贴途中进提交屏：不抛错、也不插任何东西", async (t) => {
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const questions = [question({ id: "a", header: "甲" }), question({ id: "b", header: "乙", question: "第二题" })];
+	const card = mountWithClipboard(t, { reader: { async getText() { await gate; return "/tmp/late2.png"; } } }, appKeys(), questions);
+	card.press(DOWN, DOWN, "\x16");
+	card.press(TAB, TAB); // await 期间一路走到提交屏
+	release();
+	await card.tick();
+	assert.ok(card.plain().includes("核对答案"), "仍停在提交屏");
+	assert.ok(!card.plain().includes("/tmp/late2.png"), "提交屏上不该出现内容");
+});
+test("粘贴途中焦点离开 Other 行：内容不落到别处", async (t) => {
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const card = mountWithClipboard(t, { reader: { async getText() { await gate; return "/tmp/elsewhere.png"; } } });
+	card.press(DOWN, DOWN, "\x16");
+	card.press("\x1b[A"); // 回到上一项
+	release();
+	await card.tick();
+	assert.ok(!card.plain().includes("/tmp/elsewhere.png"), `焦点已经不在 Other 行：\n${card.plain()}`);
+});
+
+test("粘贴途中卡片被取消：静默丢弃，不抛错", async (t) => {
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const card = mountWithClipboard(t, { reader: { async getText() { await gate; return "/tmp/gone.png"; } } });
+	card.press(DOWN, DOWN, "\x16");
+	card.press(ESC); // 整卡取消
+	release();
+	await card.tick();
+	assert.equal(card.plain(), "", "卡片已关闭，不该再渲染任何东西");
+});
+
+test("补空格只给文件路径，文本粘贴照宿主不补", async (t) => {
+	const files = mountWithClipboard(t, { reader: { async getFilePaths() { return ["/tmp/a.png"]; } } });
+	files.press(DOWN, DOWN, "x", "\x16");
+	await files.tick();
+	assert.ok(files.plain().includes("Other: x /tmp/a.png"), `文件路径两侧该补空格：\n${files.plain()}`);
+
+	const text = mountWithClipboard(t, { reader: { async getText() { return "Y"; } } });
+	text.press(DOWN, DOWN, "x", "\x16");
+	await text.tick();
+	assert.ok(text.plain().includes("Other: xY"), `文本不该补空格：\n${text.plain()}`);
 });

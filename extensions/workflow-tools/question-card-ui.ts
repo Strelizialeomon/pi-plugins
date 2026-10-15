@@ -1,8 +1,9 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
-	CURSOR_MARKER, Editor, getKeybindings, Key, matchesKey, stripTerminalSequences, visibleWidth, wrapTextWithAnsi,
+	CURSOR_MARKER, Editor, getKeybindings, getNativeClipboard, Key, matchesKey, stripTerminalSequences, visibleWidth, wrapTextWithAnsi,
 	type Component, type EditorTheme, type Focusable, type Keybinding, type KeybindingsManager, type TUI,
 } from "@earendil-works/pi-tui";
+import { paddedForCursor, pasteFromClipboard, type PasteDeps } from "./clipboard-paste.ts";
 import type { CardOutcome, Pick, QuestionSpec } from "./question-card.ts";
 
 const PASTE_START = "\x1b[200~";
@@ -108,6 +109,7 @@ export class QuestionCard implements Component, Focusable {
 	readonly #theme: Theme;
 	readonly #keys: KeybindingsManager;
 	readonly #glyphs: Glyphs;
+	readonly #pasteDeps: PasteDeps;
 	readonly #done: (outcome: CardOutcome | undefined) => void;
 	readonly #states: QuestionState[];
 	readonly #signal?: AbortSignal;
@@ -131,12 +133,14 @@ export class QuestionCard implements Component, Focusable {
 		done: (outcome: CardOutcome | undefined) => void,
 		signal?: AbortSignal,
 		glyphs: Glyphs = pickGlyphs(),
+		pasteDeps: PasteDeps = { reader: getNativeClipboard() },
 	) {
 		this.#questions = questions;
 		this.#tui = tui;
 		this.#theme = theme;
 		this.#keys = keys ?? getKeybindings();
 		this.#glyphs = glyphs;
+		this.#pasteDeps = pasteDeps;
 		this.#done = done;
 		this.#signal = signal;
 		this.#states = questions.map(() => ({ chosen: new Set<number>(), draft: "", notes: "", cursor: 0 }));
@@ -372,8 +376,15 @@ export class QuestionCard implements Component, Focusable {
 		// 用户实测就是那样彻底打不进字——交给 Pi 的编辑器解码才认。
 		if (!this.#isSubmit() && this.#isOther()) {
 			const pasting = this.#otherEd?.isPasting === true;
+			// 取消键先于粘贴键：宿主若把粘贴绑成 ctrl+c，用户按下去该取消就取消，不能被粘贴吃掉。
 			if (!pasting && this.#matches(data, "tui.select.cancel")) {
 				this.#finish(undefined);
+				return;
+			}
+			// 粘贴键要排在「当正文输入」前面，否则单字节 Ctrl+V 会被当成正文处理。
+			// （注意只挡得住单字节：多字符块夹着控制字节仍会原样进正文，与宿主主输入框同姿势。）
+			if (this.#matchesPasteKey(data)) {
+				void this.#pasteFromClipboard().catch(() => {});
 				return;
 			}
 			if (this.#matches(data, "tui.select.up") || this.#matches(data, "tui.select.down")) {
@@ -448,6 +459,43 @@ export class QuestionCard implements Component, Focusable {
 			}
 			this.#confirm();
 		}
+		this.#refresh();
+	}
+
+	/**
+	 * 宿主键位表里的粘贴键（`app.clipboard.pasteImage`，默认 Ctrl+V）。
+	 * 它不属于 pi-tui 的 `tui.*` 那套，类型上只能按名字匹配；
+	 * 只在焦点位于 Other 行时拦——别的位置维持现状，不动宿主的语义。
+	 */
+	#matchesPasteKey(data: string): boolean {
+		return this.#keys.matches(data, "app.clipboard.pasteImage" as Keybinding);
+	}
+
+	/** 从剪贴板取一次内容插进行内编辑器（文件路径 / 图片落盘后的路径 / 文本）。 */
+	async #pasteFromClipboard(): Promise<void> {
+		// 读剪贴板是异步的（原生模块在工作线程上跑）。await 期间用户可能切题、进提交屏、
+		// 甚至关掉卡片——那时这次粘贴已经没有落点了。少了这道闸，提交屏上 #state() 会取到
+		// undefined 并抛错，而这是个没人接的 promise，pi 的兜底会把整个进程 exit(1)。
+		const index = this.#index;
+		const outcome = await pasteFromClipboard(this.#pasteDeps);
+		if (this.#closed || this.#index !== index || this.#isSubmit() || !this.#isOther()) return;
+		if (outcome.kind === "none") return;
+		if (outcome.kind === "error") {
+			this.#error = outcome.message;
+			this.#refresh();
+			return;
+		}
+		const editor = this.#otherEditor();
+		const cursor = editor.getCursor();
+		const line = editor.getText().split("\n")[cursor.line] ?? "";
+		const before = cursor.col > 0 ? (line[cursor.col - 1] ?? "") : "";
+		const after = line[cursor.col] ?? "";
+		// 补空格只给文件路径：宿主就是这么分的（图片与文本分支直接插，不补）。
+		const text = outcome.source === "files" ? paddedForCursor(outcome.text, before, after) : outcome.text;
+		editor.insertTextAtCursor(text);
+		const draft = editor.getExpandedText();
+		this.#state().draft = draft;
+		this.#error = "";
 		this.#refresh();
 	}
 
