@@ -258,6 +258,17 @@ async function askViaRpc(
 }
 
 /**
+ * 卡片要挂成铺满终端的浮层，不是因为好看：全屏模式下 Pi 会先把 PageUp/PageDown 交给自己的
+ * 对话区滚动，只有聚焦中的浮层能拿到这套键（`TuiAltScreen.handleViewportInput` 里
+ * `shouldDeferViewportInputToOverlay` 一条）。挂在编辑槽里的普通组件拿不到，翻页会静默失效。
+ * 常规模式两种挂法都能收到，统一走浮层以免两套路径。
+ */
+export const QUESTION_CARD_MOUNT = {
+	overlay: true,
+	overlayOptions: { width: "100%", maxHeight: "100%", anchor: "bottom-left", margin: 0 },
+} as const;
+
+/**
  * 三档降级：TUI 用自绘卡片，RPC 用 Pi 支持的基础选择交互，
  * JSON / print 直接返回 `ui_unavailable`——不挂着等一个不存在的终端。
  */
@@ -272,16 +283,17 @@ export async function askQuestions(
 
 	cardOpen = true;
 	let card: QuestionCard | undefined;
-	let releaseInput: (() => void) | undefined;
 	try {
 		let picks: Pick[] | undefined;
 
 		if (ctx.mode === "tui") {
-			picks = await ctx.ui.custom<Pick[] | undefined>((tui, theme, keybindings, done) => {
-				card = new QuestionCard(questions, tui, theme, keybindings, done, signal);
-				releaseInput = ctx.ui.onTerminalInput?.((data) => card?.handleReservedInput(data) ? { consume: true } : undefined);
-				return card;
-			});
+			picks = await ctx.ui.custom<Pick[] | undefined>(
+				(tui, theme, keybindings, done) => {
+					card = new QuestionCard(questions, tui, theme, keybindings, done, signal);
+					return card;
+				},
+				QUESTION_CARD_MOUNT,
+			);
 		} else {
 			picks = await askViaRpc(ctx, questions, signal);
 		}
@@ -289,7 +301,6 @@ export async function askQuestions(
 		if (picks === undefined) return CANCELLED;
 		return buildAnsweredResult({ picks });
 	} finally {
-		releaseInput?.();
 		card?.dispose();
 		cardOpen = false;
 	}

@@ -183,17 +183,6 @@ export class QuestionCard implements Component, Focusable {
 		this.#editor = editor;
 	}
 
-	/** Fullscreen Pi otherwise routes these keys to the transcript before the focused card. */
-	handleReservedInput(data: string): boolean {
-		if (this.#closed) return false;
-		const actions: Keybinding[] = this.#editor
-			? ["tui.select.pageUp", "tui.select.pageDown", "tui.editor.pageUp", "tui.editor.pageDown"]
-			: ["tui.select.pageUp", "tui.select.pageDown"];
-		if (!actions.some((action) => this.#matches(data, action))) return false;
-		this.handleInput(data);
-		return true;
-	}
-
 	handleInput(data: string): void {
 		if (this.#closed) return;
 		if (this.#editor) {
@@ -266,13 +255,28 @@ export class QuestionCard implements Component, Focusable {
 		return wrapTextWithAnsi(text, width - indent).map((line, index) => `${index === 0 ? prefix : " ".repeat(indent)}${line}`);
 	}
 
+	/** 键名按宿主配置渲染，不写死——用户换过绑定后底栏提示仍然是真的。 */
+	#formatKey(key: string): string {
+		return key
+			.replace("pageUp", "PgUp").replace("pageDown", "PgDn")
+			.replace("escape", "Esc").replace("enter", "Enter").replace("tab", "Tab")
+			.replace(/^shift\+/, "Shift+").replace(/^ctrl\+/, "Ctrl+").replace(/^alt\+/, "Alt+")
+			.replace(/\+([a-z])$/, (_, char: string) => `+${char.toUpperCase()}`);
+	}
+
 	#key(action: Keybinding): string {
-		return (this.#keys.getKeys(action)[0] ?? "-").replace("pageUp", "PgUp").replace("pageDown", "PgDn").replace("escape", "Esc").replace("enter", "Enter").replace("tab", "Tab");
+		return this.#formatKey(this.#keys.getKeys(action)[0] ?? "-");
+	}
+
+	/** 一个动作绑了多个键时全列出来：终端认不出的那个（如 Shift+Enter）不该是唯一提示。 */
+	#allKeys(action: Keybinding): string {
+		const keys = this.#keys.getKeys(action);
+		return keys.length ? keys.map((key) => this.#formatKey(key)).join("/") : "-";
 	}
 
 	#footer(width: number): string[] {
 		const text = this.#editor
-			? `${this.#key("tui.input.submit")} 确认  Esc 返回  Ctrl+J 换行`
+			? `${this.#key("tui.input.submit")} 确认  ${this.#key("tui.select.cancel")} 返回  ${this.#allKeys("tui.input.newLine")} 换行`
 			: this.#isReview()
 				? `${this.#key("tui.select.confirm")} 提交  ${this.#key("tui.input.tab")} 返回  ${this.#key("tui.select.cancel")} 取消`
 				: `Space 选择  ${this.#key("tui.select.confirm")} 确认  ${this.#key("tui.select.cancel")} 取消`;

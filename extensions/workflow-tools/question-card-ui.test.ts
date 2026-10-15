@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { CURSOR_MARKER, getKeybindings, KeybindingsManager, stripTerminalSequences, TUI_KEYBINDINGS, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, getKeybindings, KeybindingsManager, stripTerminalSequences, TuiAltScreen, TuiMainScreen, TUI_KEYBINDINGS, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { askQuestions, type QuestionSpec } from "./question-card.ts";
 
@@ -24,8 +24,6 @@ function harness(t: TestContext, questions = [question()], rows = 24, keybinding
 	let component!: Component & { focused?: boolean; dispose?(): void };
 	let done!: (value: undefined) => void;
 	let settled = false;
-	let listener: ((data: string) => { consume?: boolean } | undefined) | undefined;
-	let released = false;
 	let palette = "32";
 	const theme = {
 		fg: (color: string, text: string) => `\x1b[${color === "success" ? palette : color === "accent" ? "36" : color === "error" ? "31" : "37"}m${text}\x1b[39m`,
@@ -35,10 +33,7 @@ function harness(t: TestContext, questions = [question()], rows = 24, keybinding
 	const tui = { terminal, requestRender() {} } as TUI;
 	const ctx = {
 		mode: "tui", hasUI: true,
-		ui: { onTerminalInput(handler: typeof listener) {
-			listener = handler;
-			return () => { listener = undefined; released = true; };
-		}, custom(factory: (tui: TUI, theme: Theme, kb: typeof keybindings, done: (value: undefined) => void) => typeof component) {
+		ui: { custom(factory: (tui: TUI, theme: Theme, kb: typeof keybindings, done: (value: undefined) => void) => typeof component) {
 			return new Promise<undefined>((resolve) => {
 				done = resolve;
 				component = factory(tui, theme, keybindings, resolve);
@@ -52,15 +47,18 @@ function harness(t: TestContext, questions = [question()], rows = 24, keybinding
 	const input = (...data: string[]) => { for (const chunk of data) component.handleInput!(chunk); };
 	const render = (width = 80) => component.render(width);
 	const plain = (width = 80) => render(width).map(stripTerminalSequences).join("\n");
-	return { input, render, plain, result, controller, component, tui, terminal, rawInput: (data: string) => listener?.(data), released: () => released, settled: () => settled, changeTheme() { palette = "92"; component.invalidate(); } };
+	return { input, render, plain, result, controller, component, tui, terminal, settled: () => settled, changeTheme() { palette = "92"; component.invalidate(); } };
 }
 
 function readPages(card: ReturnType<typeof harness>, width = 80, direction = PAGE_DOWN): string {
 	const frames: string[] = [];
 	for (let i = 0; i < 250; i++) {
-		const frame = card.plain(width);
-		if (frames.at(-1) === frame) break;
-		frames.push(frame);
+		const frame = card.render(width);
+		// 每一帧都要守住列宽，不能只查首屏那一帧
+		for (const line of frame) assert.ok(visibleWidth(line) <= width, `${width} 列下溢出：${JSON.stringify(stripTerminalSequences(line))}`);
+		const text = frame.map(stripTerminalSequences).join("\n");
+		if (frames.at(-1) === text) break;
+		frames.push(text);
 		card.input(direction);
 	}
 	return frames.join("\n");
@@ -227,15 +225,19 @@ test("4 题跳转、核对页与返回修改，未确认题不能整体提交", 
 	assert.deepEqual(await card.result, { kind: "answered", answers: { q: "B", q2: "B", q3: "A", q4: "A" } });
 });
 
-test("切换题目恢复各自焦点与阅读位置", (t) => {
-	const card = harness(t, [question({ question: "first\n".repeat(30) }), question({ id: "q2" })], 12);
+test("切换题目恢复各自的阅读位置（两题都翻过页）", (t) => {
+	const card = harness(t, [question({ question: "first\n".repeat(60) }), question({ id: "q2", question: "second\n".repeat(60) })], 12);
 	card.render(40);
-	card.input(PAGE_DOWN);
-	const first = card.plain(40);
+	card.input(PAGE_DOWN, PAGE_DOWN);
+	const firstFrame = card.plain(40);
 	card.input("\t");
 	card.render(40);
+	card.input(PAGE_DOWN);
+	const secondFrame = card.plain(40);
 	card.input(BACK_TAB);
-	assert.equal(card.plain(40), first);
+	assert.equal(card.plain(40), firstFrame, "返回时恢复该题自己的阅读位置");
+	card.input("\t");
+	assert.equal(card.plain(40), secondFrame);
 });
 
 test("注入的选择按键配置生效", async (t) => {
@@ -251,27 +253,60 @@ test("AbortSignal 取消卡片并释放活动锁，重复取消不影响后续�
 	card.controller.abort();
 	const result = await Promise.race([card.result, new Promise((resolve) => setTimeout(() => resolve("timeout"), 100))]);
 	assert.deepEqual(result, { kind: "cancelled" });
-	assert.equal(card.released(), true);
 	const next = harness(t);
 	next.input(ENTER);
 	assert.deepEqual(await next.result, { kind: "answered", answers: { q: "A" } });
 });
 
-test("全屏原始输入监听接管翻页键，关闭后释放，不接管普通键", async (t) => {
-	const card = harness(t, [question({ question: "long question\n".repeat(40) })], 12);
-	const initial = card.plain(40);
-	assert.deepEqual(card.rawInput(PAGE_DOWN), { consume: true });
-	assert.notEqual(card.plain(40), initial);
-	assert.equal(card.rawInput(DOWN), undefined);
-	card.input(DOWN, DOWN, ENTER, `\x1b[200~${Array.from({ length: 30 }, (_, i) => `line-${i}`).join("\n")}\x1b[201~`);
-	const edited = card.plain(40);
-	assert.deepEqual(card.rawInput(PAGE_UP), { consume: true });
-	assert.notEqual(card.plain(40), edited);
-	card.input(ESC, ESC);
-	assert.deepEqual(await card.result, { kind: "cancelled" });
-	assert.equal(card.released(), true);
-	assert.equal(card.rawInput(PAGE_DOWN), undefined);
-});
+const STUB_TERMINAL = {
+	columns: 80, rows: 24, kittyProtocolActive: false,
+	start() {}, stop() {}, async drainInput() {}, write() { return ""; },
+	moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {},
+};
+
+/**
+ * 按 Pi 的真实挂法走一遍：`ui.custom(factory, options)` 收到什么就照做什么。
+ * 只测卡片自己处理按键是不够的——全屏下 Pi 会先把翻页键给对话区，挂法错了就永远收不到。
+ */
+function mountedCard(t: TestContext, TuiClass: typeof TuiAltScreen | typeof TuiMainScreen, questions: QuestionSpec[]) {
+	const tui = new TuiClass(STUB_TERMINAL as never, false);
+	let component!: Component & { dispose?(): void };
+	let mountOptions: { overlay?: boolean; overlayOptions?: unknown } | undefined;
+	const ctx = {
+		mode: "tui", hasUI: true,
+		ui: {
+			custom(factory: (tui: TUI, theme: Theme, keys: KeybindingsManager, done: (value: undefined) => void) => typeof component, options?: typeof mountOptions) {
+				mountOptions = options;
+				return new Promise<undefined>((resolve) => {
+					component = factory(tui as unknown as TUI, { fg: (_c: string, text: string) => text, bold: (text: string) => text } as Theme, getKeybindings(), resolve);
+					if (options?.overlay) tui.showOverlay(component, options.overlayOptions as never);
+					else { tui.addChild(component); tui.setFocus(component); }
+				});
+			},
+		},
+	} as unknown as ExtensionContext;
+	const controller = new AbortController();
+	const result = askQuestions(ctx, questions, controller.signal);
+	t.after(async () => { controller.abort(); await result; });
+	return { tui, mountOptions: () => mountOptions, plain: () => component.render(40).map(stripTerminalSequences).join("\n") };
+}
+
+/** `handleTerminalInput` 在类型里是私有的，但正是 Pi 把终端按键送进来的那道门。 */
+const sendTerminalKey = (tui: TuiAltScreen | TuiMainScreen, data: string) =>
+	(tui as unknown as { handleTerminalInput(data: string): void }).handleTerminalInput(data);
+
+for (const [name, TuiClass] of [["全屏", TuiAltScreen], ["常规", TuiMainScreen]] as const) {
+	test(`${name}模式下翻页键真的到达卡片，来回翻位置准确`, async (t) => {
+		const card = mountedCard(t, TuiClass, [question({ question: "long question\n".repeat(40) })]);
+		assert.equal(card.mountOptions()?.overlay, true, "必须挂成浮层：挂编辑槽的普通组件在全屏下拿不到 PageUp/PageDown");
+		const before = card.plain();
+		sendTerminalKey(card.tui, PAGE_DOWN);
+		const after = card.plain();
+		assert.notEqual(after, before, "翻页键必须真的改变阅读位置");
+		sendTerminalKey(card.tui, PAGE_UP);
+		assert.equal(card.plain(), before);
+	});
+}
 
 test("核对页取消不返回局部答案", async (t) => {
 	const card = harness(t, [question(), question({ id: "q2" })]);
@@ -304,4 +339,82 @@ test("空格取消 Other 后重新编辑可恢复草稿", async (t) => {
 	const result = await card.result;
 	assert.equal(result.kind, "answered");
 	if (result.kind === "answered") assert.equal(result.responses?.q, "draft");
+});
+
+test("焦点移到屏幕外的选项时自动滚进视口", (t) => {
+	const card = harness(t, [question({
+		question: "长题干\n".repeat(30),
+		options: [{ label: "AAA", description: "" }, { label: "BBB", description: "" }, { label: "CCC", description: "" }],
+	})], 12);
+	assert.ok(!card.plain(40).includes("CCC"), "这三个选项一开始都在视口外");
+	card.input(DOWN, DOWN);
+	assert.match(card.plain(40), /> \( \) CCC/, "焦点移过去后该选项必须可见");
+	card.input(UP, UP);
+	assert.match(card.plain(40), /> \( \) AAA/);
+});
+
+test("选了但没确认的题不能整体提交", async (t) => {
+	const card = harness(t, [question(), question({ id: "q2" })]);
+	card.input(" ", "\t", " ", "\t");
+	assert.match(card.plain(), /核对/);
+	card.input(ENTER);
+	await Promise.resolve();
+	assert.equal(card.settled(), false, "未确认的题不能被整体提交");
+	assert.match(card.plain(), /\[1\/2\]/);
+	assert.match(card.plain(), /请先选择并确认/);
+});
+
+test("核对页能翻页读完长答案", async (t) => {
+	const long = `${"补充说明 ".repeat(120)}ANSWER_END`;
+	const card = harness(t, [question(), question({ id: "q2" })], 12);
+	card.input(DOWN, DOWN, ENTER, `\x1b[200~${long}\x1b[201~`, ENTER, "\t");
+	assert.match(card.plain(40), /核对/);
+	assert.ok(readPages(card, 40).includes("ANSWER_END"), "核对页要能翻到长答案末尾");
+});
+
+test("缩窄并降低高度后重新排版，内容仍可达且不溢出", (t) => {
+	const card = harness(t, [question({
+		question: `${"问题 ".repeat(60)}TEXT_END`,
+		options: [{ label: "A", description: `${"说明 ".repeat(60)}DESC_END` }],
+	})], 24);
+	card.render(80);
+	card.terminal.rows = 12;
+	assert.ok(readPages(card, 40).includes("DESC_END"));
+	card.terminal.rows = 24;
+	assert.ok(card.plain(80).includes("问题"));
+	card.input(ENTER);
+});
+
+test("Other 行标为「Other（自定义）」", (t) => {
+	const card = harness(t, [question()]);
+	card.input(DOWN, DOWN);
+	assert.ok(card.render(40).map(stripTerminalSequences).some((line) => line.includes("Other（自定义）")));
+});
+
+test("描述续行保持 6 空格缩进，不与勾选标记挤成一长行", (t) => {
+	const card = harness(t, [question({
+		options: [
+			{ label: "A", description: `${"很长的说明文字 ".repeat(20)}DESC_TAIL` },
+			{ label: "B", description: "短说明" },
+		],
+	})]);
+	const lines = card.render(40).map(stripTerminalSequences);
+	const start = lines.findIndex((line) => line.includes("很长的说明文字"));
+	assert.ok(start >= 0, "描述首行必须渲染出来");
+	assert.ok(lines[start]!.startsWith("      "), "描述首行缩进 6 空格");
+	assert.ok(lines[start + 1]!.startsWith("      "), "描述续行保持同一缩进");
+	assert.ok(lines[start + 1]!.trim().length > 0);
+});
+
+test("编辑态底栏的换行键跟随宿主键位配置", (t) => {
+	const card = harness(t, [question()], 24, new KeybindingsManager(TUI_KEYBINDINGS, { "tui.input.newLine": "ctrl+j" }));
+	card.input(DOWN, DOWN, ENTER);
+	assert.match(card.plain(), /Ctrl\+J 换行/);
+	assert.ok(!card.plain().includes("Shift+Enter"), "只绑了一个键就不该提示另一个");
+});
+
+test("默认键位下换行提示列出所有可用键", (t) => {
+	const card = harness(t, [question()]);
+	card.input(DOWN, DOWN, ENTER);
+	assert.match(card.plain(), /Shift\+Enter\/Ctrl\+J 换行/);
 });
