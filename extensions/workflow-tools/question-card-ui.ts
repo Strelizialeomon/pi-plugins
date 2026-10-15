@@ -276,7 +276,7 @@ export class QuestionCard implements Component, Focusable {
 		}
 	}
 
-	#edit(which: Editing): void {
+	#edit(which: Editing): FullTextEditor {
 		const theme: EditorTheme = {
 			borderColor: (text) => this.#theme.fg("borderAccent", text),
 			selectList: {
@@ -315,6 +315,7 @@ export class QuestionCard implements Component, Focusable {
 		};
 		this.#editor = editor;
 		this.#editing = which;
+		return editor;
 	}
 
 	#leaveEdit(): void {
@@ -390,8 +391,22 @@ export class QuestionCard implements Component, Focusable {
 				return;
 			}
 			this.#confirm();
+		} else if (!this.#isSubmit() && this.#isOther() && this.#isTyping(data)) {
+			// 上游的 Other 就是个内联输入框：打字（或粘贴）直接落到它上面，不需要先按 Enter。
+			// 走到这里说明这一下输入没被任何已绑定按键吃掉，是真正的正文输入。
+			const editor = this.#edit("other");
+			editor.handleInput(data);
+			this.#state().draft = editor.getExpandedText();
+			this.#refresh();
+			return;
 		}
 		this.#refresh();
+	}
+
+	/** 这一下输入是「打字 / 粘贴」而不是某个按键：只在这一层兜底里用。 */
+	#isTyping(data: string): boolean {
+		if (data.startsWith(PASTE_START)) return true;
+		return !data.includes("\x1b") && data.length > 0 && data.charCodeAt(0) >= 32;
 	}
 
 	/** 光标停在 Chat 行上（只有单选才有这一项，编号接在 Other 之后）。 */

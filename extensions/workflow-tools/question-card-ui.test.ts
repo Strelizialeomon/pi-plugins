@@ -648,3 +648,31 @@ test("卡片自己的颜色序列不被破坏，外部文本里的转义序列�
 	assert.ok(!raw.includes("\x1b[31m") && !raw.includes("\x1b[32m"), "外部文本里的转义序列不能穿进渲染");
 	assert.ok(plain.includes("题红") && plain.includes("A绿"), "剥掉转义后正文要留着");
 });
+
+// —— Other 行「打字即进编辑器」（上游的 Other 就是个内联输入框，不需要先按 Enter） ——
+
+test("焦点在 Other 行时直接打字就进编辑器，并吃掉这一下输入", async (t) => {
+	const card = harness(t, [question()], 24, 80);
+	card.input(DOWN, DOWN); // 移到 Other
+	card.input("你", "好"); // 直接打字
+	assert.ok(card.plain().includes("你好"), "打字应进编辑器并落到草稿上");
+	card.input(ENTER);
+	const outcome = (await card.result) as { answers: Record<string, string> };
+	assert.equal(outcome.answers.q, "你好");
+});
+
+test("Other 行上整段粘贴同样直接进编辑器", async (t) => {
+	const card = harness(t, [question()], 24, 80);
+	card.input(DOWN, DOWN, "\x1b[200~第一行\n第二行\x1b[201~");
+	assert.ok(card.plain().includes("第一行"), "粘贴应进编辑器");
+	card.input(ENTER);
+	const outcome = (await card.result) as { responses?: Record<string, string> };
+	assert.equal(outcome.responses?.q, "第一行\n第二行");
+});
+
+test("普通项上打字不误开编辑器", async (t) => {
+	const card = harness(t, [question()], 24, 80);
+	card.input("你", "好");
+	assert.ok(!card.plain().includes("你好"), "焦点在普通项上打字不该开 Other 编辑器");
+	assert.ok(card.plain().includes("❯ 1. A"), "焦点应留在原地");
+});
