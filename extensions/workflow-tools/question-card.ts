@@ -7,6 +7,7 @@
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { OverlayHandle } from "@earendil-works/pi-tui";
 import { QuestionCard } from "./question-card-ui.ts";
 
 export type QuestionMode = "tui" | "rpc" | "json" | "print";
@@ -262,6 +263,8 @@ async function askViaRpc(
  * 对话区滚动，只有聚焦中的浮层能拿到这套键（`TuiAltScreen.handleViewportInput` 里
  * `shouldDeferViewportInputToOverlay` 一条）。挂在编辑槽里的普通组件拿不到，翻页会静默失效。
  * 常规模式两种挂法都能收到，统一走浮层以免两套路径。
+ *
+ * 代价（已写进 README 与规格）：浮层期间宿主自己的视口滚动键也一并让给卡片，答题时滚不动转录。
  */
 export const QUESTION_CARD_MOUNT = {
 	overlay: true,
@@ -283,6 +286,7 @@ export async function askQuestions(
 
 	cardOpen = true;
 	let card: QuestionCard | undefined;
+	let overlay: OverlayHandle | undefined;
 	try {
 		let picks: Pick[] | undefined;
 
@@ -292,7 +296,7 @@ export async function askQuestions(
 					card = new QuestionCard(questions, tui, theme, keybindings, done, signal);
 					return card;
 				},
-				QUESTION_CARD_MOUNT,
+				{ ...QUESTION_CARD_MOUNT, onHandle: (handle) => { overlay = handle; } },
 			);
 		} else {
 			picks = await askViaRpc(ctx, questions, signal);
@@ -301,6 +305,10 @@ export async function askQuestions(
 		if (picks === undefined) return CANCELLED;
 		return buildAnsweredResult({ picks });
 	} finally {
+		// Pi 关闭浮层时弹的是「栈顶那条」。若关闭瞬间上面还压着宿主自己的浮层（全屏转录搜索），
+		// 被弹掉的是它，卡片这条会永远留在栈里——全屏视口键从此一直让路给一张关掉的卡片。
+		// 这里按句柄补一次精确出栈；正常路径上它早被弹掉了，是空操作。
+		overlay?.hide();
 		card?.dispose();
 		cardOpen = false;
 	}

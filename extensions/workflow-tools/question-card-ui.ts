@@ -9,6 +9,9 @@ import type { Pick, QuestionSpec } from "./question-card.ts";
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
 
+/** 键名里这几个人话化后更好认；其余按键名首字母大写即可。 */
+const NAMED_KEYS: Record<string, string> = { pageUp: "PgUp", pageDown: "PgDn", escape: "Esc", enter: "Enter", tab: "Tab" };
+
 /** Use native editing/undo, but insert pastes through the non-collapsing public API. */
 class FullTextEditor extends Editor {
 	#paste: string | undefined;
@@ -257,11 +260,11 @@ export class QuestionCard implements Component, Focusable {
 
 	/** 键名按宿主配置渲染，不写死——用户换过绑定后底栏提示仍然是真的。 */
 	#formatKey(key: string): string {
-		return key
-			.replace("pageUp", "PgUp").replace("pageDown", "PgDn")
-			.replace("escape", "Esc").replace("enter", "Enter").replace("tab", "Tab")
-			.replace(/^shift\+/, "Shift+").replace(/^ctrl\+/, "Ctrl+").replace(/^alt\+/, "Alt+")
-			.replace(/\+([a-z])$/, (_, char: string) => `+${char.toUpperCase()}`);
+		const parts = key.split("+");
+		const last = parts.pop() ?? "";
+		const base = NAMED_KEYS[last] ?? (last.length === 1 ? last.toUpperCase() : last.charAt(0).toUpperCase() + last.slice(1));
+		const head = parts.filter(Boolean).map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join("+");
+		return head ? `${head}+${base}` : base;
 	}
 
 	#key(action: Keybinding): string {
@@ -275,8 +278,11 @@ export class QuestionCard implements Component, Focusable {
 	}
 
 	#footer(width: number): string[] {
+		// 编辑态的确认与换行都走 Pi 的 Editor（认 `tui.input.submit` / `tui.input.newLine`），
+		// 所以按宿主键位渲染；返回是本卡片硬编码的 Escape（见 handleInput 的编辑器分支），
+		// 不搬 `tui.select.cancel`——搬了会在宿主改绑后写出一条按下去没反应的提示。
 		const text = this.#editor
-			? `${this.#key("tui.input.submit")} 确认  ${this.#key("tui.select.cancel")} 返回  ${this.#allKeys("tui.input.newLine")} 换行`
+			? `${this.#key("tui.input.submit")} 确认  Esc 返回  ${this.#allKeys("tui.input.newLine")} 换行`
 			: this.#isReview()
 				? `${this.#key("tui.select.confirm")} 提交  ${this.#key("tui.input.tab")} 返回  ${this.#key("tui.select.cancel")} 取消`
 				: `Space 选择  ${this.#key("tui.select.confirm")} 确认  ${this.#key("tui.select.cancel")} 取消`;

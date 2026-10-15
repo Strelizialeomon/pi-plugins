@@ -265,21 +265,27 @@ const STUB_TERMINAL = {
 };
 
 /**
- * 按 Pi 的真实挂法走一遍：`ui.custom(factory, options)` 收到什么就照做什么。
- * 只测卡片自己处理按键是不够的——全屏下 Pi 会先把翻页键给对话区，挂法错了就永远收不到。
+ * 按 Pi 的真实挂法走一遍：`ui.custom(factory, options)` 收到什么就照做什么，关闭时也照
+ * `showExtensionCustom` 走「按栈顶弹一次 + resolve」。只测卡片自己处理按键是不够的——
+ * 全屏下 Pi 会先把翻页键给对话区，挂法错了就永远收不到。
  */
 function mountedCard(t: TestContext, TuiClass: typeof TuiAltScreen | typeof TuiMainScreen, questions: QuestionSpec[]) {
 	const tui = new TuiClass(STUB_TERMINAL as never, false);
 	let component!: Component & { dispose?(): void };
-	let mountOptions: { overlay?: boolean; overlayOptions?: unknown } | undefined;
+	let close!: (value: undefined) => void;
+	let mountOptions: { overlay?: boolean; overlayOptions?: unknown; onHandle?: (handle: unknown) => void } | undefined;
 	const ctx = {
 		mode: "tui", hasUI: true,
 		ui: {
 			custom(factory: (tui: TUI, theme: Theme, keys: KeybindingsManager, done: (value: undefined) => void) => typeof component, options?: typeof mountOptions) {
 				mountOptions = options;
 				return new Promise<undefined>((resolve) => {
-					component = factory(tui as unknown as TUI, { fg: (_c: string, text: string) => text, bold: (text: string) => text } as Theme, getKeybindings(), resolve);
-					if (options?.overlay) tui.showOverlay(component, options.overlayOptions as never);
+					close = (value) => {
+						if (options?.overlay) tui.hideOverlay();
+						resolve(value);
+					};
+					component = factory(tui as unknown as TUI, { fg: (_c: string, text: string) => text, bold: (text: string) => text } as Theme, getKeybindings(), close);
+					if (options?.overlay) options.onHandle?.(tui.showOverlay(component, options.overlayOptions as never));
 					else { tui.addChild(component); tui.setFocus(component); }
 				});
 			},
@@ -288,7 +294,7 @@ function mountedCard(t: TestContext, TuiClass: typeof TuiAltScreen | typeof TuiM
 	const controller = new AbortController();
 	const result = askQuestions(ctx, questions, controller.signal);
 	t.after(async () => { controller.abort(); await result; });
-	return { tui, mountOptions: () => mountOptions, plain: () => component.render(40).map(stripTerminalSequences).join("\n") };
+	return { tui, mountOptions: () => mountOptions, abort: () => controller.abort(), result, plain: () => component.render(40).map(stripTerminalSequences).join("\n") };
 }
 
 /** `handleTerminalInput` 在类型里是私有的，但正是 Pi 把终端按键送进来的那道门。 */
@@ -307,6 +313,17 @@ for (const [name, TuiClass] of [["全屏", TuiAltScreen], ["常规", TuiMainScre
 		assert.equal(card.plain(), before);
 	});
 }
+
+test("关闭时宿主浮层压在上面，卡片条目也不能留在浮层栈里", async (t) => {
+	const card = mountedCard(t, TuiAltScreen, [question()]);
+	// 模拟答题期间用户打开了 Pi 自己的浮层（全屏 ctrl+shift+f 的转录搜索），此时卡片被中止。
+	// 关闭必须由卡片自己发起（真实路径就是如此）：命中 Pi 的 close 后它弹的是「栈顶那条」。
+	card.tui.showOverlay({ render: () => [""], invalidate() {}, handleInput() {} }, { width: 10 });
+	assert.equal(card.tui.hasOverlay(), true);
+	card.abort();
+	await card.result;
+	assert.equal(card.tui.hasOverlay(), false, "残留的死浮层会让全屏视口键一直让路，且只有重启能恢复");
+});
 
 test("核对页取消不返回局部答案", async (t) => {
 	const card = harness(t, [question(), question({ id: "q2" })]);
@@ -417,4 +434,22 @@ test("默认键位下换行提示列出所有可用键", (t) => {
 	const card = harness(t, [question()]);
 	card.input(DOWN, DOWN, ENTER);
 	assert.match(card.plain(), /Shift\+Enter\/Ctrl\+J 换行/);
+});
+
+test("双修饰键按 Ctrl+Shift+J 渲染", (t) => {
+	const card = harness(t, [question()], 24, new KeybindingsManager(TUI_KEYBINDINGS, { "tui.input.newLine": "ctrl+shift+j" }));
+	card.input(DOWN, DOWN, ENTER);
+	assert.match(card.plain(), /Ctrl\+Shift\+J 换行/);
+});
+
+test("单词键名也首字母大写，与同一行其他提示写法一致", (t) => {
+	const card = harness(t, [question()], 24, new KeybindingsManager(TUI_KEYBINDINGS, { "tui.select.confirm": "space" }));
+	assert.match(card.plain(), /Space 确认/);
+});
+
+test("宿主改绑取消键后，编辑态返回提示仍写实际生效的 Esc", (t) => {
+	const card = harness(t, [question()], 24, new KeybindingsManager(TUI_KEYBINDINGS, { "tui.select.cancel": "ctrl+c" }));
+	card.input(DOWN, DOWN, ENTER);
+	assert.match(card.plain(), /Esc 返回/);
+	assert.ok(!card.plain().includes("Ctrl+C 返回"), "提示不能写成按下去没反应的键");
 });
