@@ -403,7 +403,7 @@ test("RPC 降级：多选拆成连续单选并标 degraded", async () => {
 					header: "h",
 					multiSelect: true,
 					options: [
-						{ label: "A", description: "", preview: "预览不该出现在 RPC 结果里" },
+						{ label: "A", description: "" },
 						{ label: "B", description: "" },
 					],
 				},
@@ -414,10 +414,9 @@ test("RPC 降级：多选拆成连续单选并标 degraded", async () => {
 		ctx,
 	);
 
-	const details = result.details as { answers: Record<string, string>; annotations?: Record<string, { degraded?: boolean; preview?: string }> };
+	const details = result.details as { answers: Record<string, string>; annotations?: Record<string, { degraded?: boolean }> };
 	assert.equal(details.answers.q, "A");
 	assert.equal(details.annotations?.q.degraded, true, "RPC 降级要标记出来");
-	assert.equal(details.annotations?.q.preview, undefined, "RPC 下 preview 应被丢弃");
 });
 
 test("RPC 取消：整批问卷作废，不当成答完", async () => {

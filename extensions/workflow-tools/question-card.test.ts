@@ -121,10 +121,9 @@ test("没走 Other 的题目不进 responses，保持结果干净", () => {
 
 test("annotations 与 answers 同构，都用 id 作 key", () => {
 	const result = buildAnsweredResult({
-		picks: [{ id: "q1", selected: ["A"], preview: "预览正文", notes: "我记一笔" }],
+		picks: [{ id: "q1", selected: ["A"], notes: "我记一笔" }],
 	});
 	assert.deepEqual(Object.keys(result.annotations ?? {}), ["q1"]);
-	assert.equal(result.annotations?.q1.preview, "预览正文");
 	assert.equal(result.annotations?.q1.notes, "我记一笔");
 });
 

@@ -20,7 +20,7 @@ export default function (pi: ExtensionAPI) {
 				id: "scope", header: "优化范围", multiSelect: true,
 				question: long ? `${"请完整阅读问题与选项说明，确认优化范围。".repeat(20)} QUESTION_END` : "本次优化包含哪些内容？",
 				options: [
-					{ label: "完整阅读", description: long ? `${"换行后可翻页查看完整内容。".repeat(30)} DESCRIPTION_END` : "完整显示题目与选项说明。", preview: long ? `${"辅助预览不进入答案。".repeat(20)} PREVIEW_END` : "支持窄屏与长文本。" },
+					{ label: "完整阅读", description: long ? `${"换行后可翻页查看完整内容。".repeat(30)} DESCRIPTION_END` : "完整显示题目与选项说明。" },
 					{ label: "可靠输入", description: "允许粘贴多行内容并保留草稿。" },
 				],
 			};

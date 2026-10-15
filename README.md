@@ -64,7 +64,7 @@ pi --extension ./extensions/<你的插件名>/index.ts
 
 | 工具 | 干什么 |
 |---|---|
-| `ask_user_question` | 结构化选项卡：1～4 题、单选/多选、自由输入、可选预览 |
+| `ask_user_question` | 结构化选项卡：1～4 题、单选/多选、自由输入（Other 行内输入）|
 | `monitor` | 监听一条 shell 命令的输出行，或订阅一个已登记任务的事件 |
 | `subagent` | 在独立 Pi 子会话里跑专用 agent：单个 / 并行 / 链式 |
 | `task_stop` | 停掉还在跑的 monitor 或 subagent（打整个进程组） |
@@ -88,7 +88,7 @@ pi --extension ./extensions/workflow-tools/index.ts   # 或只临时加载这一
 
 ### 问答卡片怎么操作（TUI）
 
-卡片按终端尺寸排版，整体不超过「终端行数 − 4」。**超屏的题目、选项描述、预览、备注一律剪掉**，并在剪的位置标出 `─── ✂ ─── N lines hidden ───`；`preview` 超过 2000 字符直接不渲染，只留一句提示。上一版的「全文可读、`PgUp`/`PgDn` 翻页」自本版起取消：`PgUp` / `PgDn` 不再归卡片。
+卡片按终端尺寸排版，整体不超过「终端行数 − 4」。**超屏的题目、选项描述、备注一律剪掉**，并在剪的位置标出 `─── ✂ ─── N lines hidden ───`。上一版的「全文可读、`PgUp`/`PgDn` 翻页」自本版起取消：`PgUp` / `PgDn` 不再归卡片；预览（`preview`）这个字段整个去掉了。
 
 | 按键（沿用 Pi 键位配置，默认如下） | 行为 |
 |---|---|
@@ -101,8 +101,7 @@ pi --extension ./extensions/workflow-tools/index.ts   # 或只临时加载这一
 | `Esc` | 编辑态退回列表并保留草稿；列表或提交屏取消整批 |
 
 - **选项行与颜色**：单选 `❯ 1. 标签 ✔`（勾在尾部），多选 `❯ 1. [✔] 标签`（框在前）；焦点用强调色、已选用成功色并加粗、描述用次级色。字形随终端能力切换，回退档是 `> 1. [×] 标签`（`√` 与 `×` 不是 ASCII，与上游回退表一致）。颜色不是唯一提示——光标、勾、方框各自独立可辨。
-- **预览并排**：单选且至少一个选项带 `preview`、终端 ≥ 54 列时，左栏 30 列放选项、右栏放预览；焦点落到没有预览的选项时右栏显示「本项无预览」而不是收起。其余情况（多选 / 无预览 / 终端过窄）走单列，预览跟在正文之后。
-- **Other 是完整编辑器**：支持终端粘贴、带起止标记的粘贴、分块送达的粘贴，以及含换行、中文、emoji 的多行内容；长输入按受限高度滚动。`Enter` 采用，空白输入报错并停在编辑态；换行键跟随宿主键位配置，卡片底部会列出当前可用的键（默认 `Shift+Enter` / `Ctrl+J`）。
+- **Other 行本身就是输入框**：切到 `❯ N. Other: ` 直接打字或粘贴，文字就接在冒号后面，不弹边框编辑器。`Enter` 采用并确认本题（空输入报错）；`↑↓` 走开、文字留着，回来接着改；`←→` 移文本光标，`Backspace` 删字，多行内容按受限高度滚动。底层复用 Pi 的编辑器，粘贴、emoji、中文与 IME 都走它。
 - **草稿与答案分开**：编辑态 `Esc` 不清空草稿，重新进入可继续改；没采用的草稿不进答案。单选与 Other 互斥，多选里 Other 是可独立取消的补充项。
 - **备注**：`n` 给当前题加备注，随答案一起回传，落在 `annotations[id].notes`。**只填备注不算作答**——本题仍需一个选择或非空 Other。
 - **Chat about this**：单选时列表末尾有这一项，选中即结束整卡、返回 `kind: "chat"`，候选答案与草稿全部丢弃。它给的是「先不选，聊两句」的出口，多选与提交屏都没有它。
@@ -142,7 +141,7 @@ subagent(run_in_background: true)  → 派 reviewer；完成后运行时自动�
 
 ### 工具参数速查
 
-`ask_user_question`：`questions[]`，每题 `{ id, question, header(≤12 字), multiSelect, options[2..4] }`；选项 `{ label, description?, preview? }`。`id` 必填且题内唯一——答案以它作 key。`Other` 与 `Chat about this` 由卡片自动提供，两者都是保留字，别自己加。结果 `{ kind, answers, responses?, annotations? }`：`kind` 取值 `answered` / `chat` / `cancelled` / `busy` / `ui_unavailable` / `invalid_arguments`，`notes` 落在 `annotations[id].notes`。
+`ask_user_question`：`questions[]`，每题 `{ id, question, header(≤12 字), multiSelect, options[2..4] }`；选项 `{ label, description }`。`id` 必填且题内唯一——答案以它作 key。`Other` 与 `Chat about this` 由卡片自动提供，两者都是保留字，别自己加。结果 `{ kind, answers, responses?, annotations? }`：`kind` 取值 `answered` / `chat` / `cancelled` / `busy` / `ui_unavailable` / `invalid_arguments`，`notes` 落在 `annotations[id].notes`。
 
 `monitor`：`{ description, command? , task_id?, timeout_ms?, deliver? }`。`command` 与 `task_id` 二选一。`timeout_ms` 默认 300000、最大 1800000、`0` 表示持续，**只对 `command` 有效**。`deliver` 默认 `"digest"`（30 秒窗口合并），传 `"terminal"` 则进度完全不进上下文。
 

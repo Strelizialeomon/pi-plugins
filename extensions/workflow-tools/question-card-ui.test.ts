@@ -24,16 +24,6 @@ function question(over: Partial<QuestionSpec> = {}): QuestionSpec {
 	};
 }
 
-function withPreview(over: Partial<QuestionSpec> = {}): QuestionSpec {
-	return question({
-		options: [
-			{ label: "A", description: "第一个", preview: "预览一\n预览二" },
-			{ label: "B", description: "第二个" },
-		],
-		...over,
-	});
-}
-
 function harness(t: TestContext, questions: QuestionSpec[] = [question()], rows = 24, columns = 80, keybindings = getKeybindings()) {
 	let component: (Component & { focused?: boolean; dispose?(): void }) | undefined;
 	let settle!: (value: CardOutcome | undefined) => void;
@@ -67,38 +57,14 @@ function harness(t: TestContext, questions: QuestionSpec[] = [question()], rows 
 
 // —— 布局与尺寸 ——
 
-test("单选且有预览、终端够宽时走并排：左栏 30 列、右栏占其余", (t) => {
-	const card = harness(t, [withPreview()], 24, 80);
-	const frame = card.lines();
-	assert.ok(frame.some((line) => line.startsWith("❯ 1. A")), "左栏应从第 1 列开始");
-	assert.ok(frame.some((line) => line.includes("┌")), "右栏应带边框");
-	card.assertFits();
-});
-
-test("多选、无预览、终端过窄三种情况都不走并排", async (t) => {
-	const multi = harness(t, [withPreview({ multiSelect: true })], 24, 80);
-	assert.ok(!multi.lines().some((line) => line.includes("┌")), "多选不该有预览栏");
-	await multi.close();
-
-	const noPreview = harness(t, [question()], 24, 80);
-	assert.ok(!noPreview.lines().some((line) => line.includes("┌")), "无预览不该有预览栏");
-	await noPreview.close();
-
-	// 单列时预览跟在正文之后、铺满整宽；并排时它一定从第 35 列（30 + 4）开始。
-	const narrow = harness(t, [withPreview()], 24, 40);
-	const narrowFrame = narrow.lines();
-	assert.ok(!narrowFrame.some((line) => line[34] === "┌"), "40 列不该并排");
-	assert.ok(narrowFrame.some((line) => line.startsWith("┌")), "单列时预览应铺满整宽");
-});
-
 test("卡片总高不超过终端行数 − 4，且高度跟着内容走", async (t) => {
 	for (const rows of [12, 24, 40]) {
 		const short = harness(t, [question()], rows);
 		assert.ok(short.lines().length <= rows - 4, `${rows} 行终端下短内容卡片 ${short.lines().length} 行`);
 		await short.close();
 
-		const long = harness(t, [withPreview({ options: [
-			{ label: "A", description: "一", preview: Array.from({ length: 60 }, (_, i) => `预览 ${i}`).join("\n") },
+		const long = harness(t, [question({ options: [
+			{ label: "A", description: `长描述 ${"很长".repeat(300)}` },
 			{ label: "B", description: "二" },
 		] })], rows);
 		assert.ok(long.lines().length <= rows - 4, `${rows} 行终端下长内容卡片 ${long.lines().length} 行`);
@@ -106,19 +72,10 @@ test("卡片总高不超过终端行数 − 4，且高度跟着内容走", async
 	}
 });
 
-test("并排时移动焦点不改形态，焦点落到无预览的选项时右栏显示占位", (t) => {
-	const card = harness(t, [withPreview()], 24, 80);
-	assert.ok(card.plain().includes("预览一"));
-	card.input(DOWN);
-	const after = card.plain();
-	assert.ok(after.includes("┌"), "移动焦点后仍是并排");
-	assert.ok(after.includes("本项无预览"), "无预览项应显示占位而非收起右栏");
-});
-
 test("40/80/120 列 × 12/24/40 行下每行都不超过可用列宽", async (t) => {
 	for (const columns of [40, 80, 120]) {
 		for (const rows of [12, 24, 40]) {
-			const card = harness(t, [withPreview({ question: "问题".repeat(40) })], rows, columns);
+			const card = harness(t, [question({ question: "问题".repeat(40) })], rows, columns);
 			card.assertFits(columns);
 			await card.close();
 		}
@@ -126,46 +83,6 @@ test("40/80/120 列 × 12/24/40 行下每行都不超过可用列宽", async (t)
 });
 
 // —— 剪裁 ——
-
-test("预览超行被剪掉，标注写明剪了几行，且排在内容之后、下边框之前", (t) => {
-	const card = harness(t, [withPreview({ options: [
-		{ label: "A", description: "一", preview: Array.from({ length: 40 }, (_, i) => `预览 ${i + 1}`).join("\n") },
-		{ label: "B", description: "二" },
-	] })], 24, 80);
-	const frame = card.lines();
-	const marker = frame.findIndex((line) => line.includes("✂"));
-	assert.ok(marker > 0, "应出现剪裁标注");
-	assert.match(frame[marker]!, /─── ✂ ─── \d+ lines hidden/);
-	const hiddenCount = Number(/✂ ─── (\d+) lines hidden/.exec(frame[marker]!)![1]);
-	assert.ok(hiddenCount > 0);
-	assert.ok(frame[marker - 1]!.includes("预览"), "标注前应是内容行");
-	assert.ok(frame[marker + 1]!.includes("└"), "标注后应紧接下边框");
-});
-
-test("终端变高后剪掉的行数跟着变少", async (t) => {
-	const longPreview = withPreview({ options: [
-		{ label: "A", description: "一", preview: Array.from({ length: 60 }, (_, i) => `预览 ${i + 1}`).join("\n") },
-		{ label: "B", description: "二" },
-	] });
-	const hidden = async (rows: number) => {
-		const card = harness(t, [longPreview], rows, 80);
-		const line = card.lines().find((l) => l.includes("✂"))!;
-		const count = Number(/✂ ─── (\d+) lines hidden/.exec(line)![1]);
-		await card.close();
-		return count;
-	};
-	assert.ok(await hidden(40) < await hidden(24), "更高的终端应少剪一些");
-});
-
-test("预览超过 2000 字符整块不渲染，改一句提示；1999 字符照常渲染", async (t) => {
-	const over = harness(t, [withPreview({ options: [{ label: "A", description: "一", preview: "预".repeat(2001) }, { label: "B", description: "二" }] })], 40, 80);
-	assert.ok(!over.plain().includes("预预预"), "超限预览不得渲染正文");
-	assert.ok(over.plain().includes("预览过长"), "应给出提示句");
-	await over.close();
-
-	const under = harness(t, [withPreview({ options: [{ label: "A", description: "一", preview: "预".repeat(1999) }, { label: "B", description: "二" }] })], 40, 80);
-	assert.ok(under.plain().includes("预预预"), "1999 字符应正常渲染");
-});
 
 test("超长题目被剪裁并标注，卡片不因此变高", (t) => {
 	const rows = 24;
@@ -235,7 +152,7 @@ test("没有任何有效选择时按 Enter 报错并停在原地", (t) => {
 
 test("列表项超过 5 项时窗口滚动，焦点跟随并给出位置提示", (t) => {
 	// 4 个选项 + Other + Chat = 6 项 > 5（Chat 只在单选出现，所以这里必须是单选）。
-	const q = withPreview({
+	const q = question({
 		options: [
 			{ label: "A", description: "" },
 			{ label: "B", description: "" },
@@ -398,16 +315,17 @@ test("AbortSignal 取消卡片并释放活动锁，重复取消不影响后续�
 	assert.deepEqual(await next.result, { kind: "answered", answers: { q: "A" } });
 });
 
-test("编辑态 Esc 退回列表并保留草稿，重新进入可继续改", (t) => {
+test("Other 行行内输入：打字接在后面，走开后文字留着", (t) => {
 	const card = harness(t, [question()], 24, 80);
-	card.input(DOWN, DOWN, ENTER); // 进入 Other 编辑
+	card.input(DOWN, DOWN);
 	card.input("草", "稿");
-	card.input(ESC);
-	assert.ok(card.plain().includes("Other · 草稿"), "列表里应标出草稿");
-	card.input(ENTER);
-	assert.ok(card.plain().includes("草稿"), "重新进入应恢复草稿");
+	assert.ok(card.plain().includes("Other: 草稿"), `打字该接在 Other: 后面：\n${card.plain()}`);
+	card.input("\x1b[A"); // ↑ 离开这一行
+	assert.ok(card.plain().includes("❯ 2. B"), "焦点回到上一项");
+	assert.ok(card.plain().includes("Other: 草稿"), "走开后文字还留着");
+	card.input("\x1b[B", "\x1b[B"); // 回到 Other
+	assert.ok(card.plain().includes("Other: 草稿"), "回来还能接着改");
 });
-
 test("注入的按键配置生效：改绑确认键后旧键不再确认", async (t) => {
 	const keys = new KeybindingsManager(TUI_KEYBINDINGS, { "tui.select.confirm": "ctrl+y" });
 	const card = harness(t, [question()], 24, 80, keys);
@@ -447,7 +365,7 @@ test("中文、emoji、组合字符、显式换行与无空格长 URL 都不溢�
 		const card = harness(t, [question({
 			question: text,
 			options: [
-				{ label: `标签 👩🏽‍🚀 ${"长".repeat(30)}`, description: text, preview: text },
+				{ label: `标签 👩🏽‍🚀 ${"长".repeat(30)}`, description: text },
 				{ label: "B", description: url },
 			],
 		})], 40, columns);
@@ -469,7 +387,7 @@ test("Other 行空着时显示占位文案，采用后换成正文", async (t) =
 
 	// 单题卡片采用 Other 就直接结束了，看不到列表——用两题卡回退着看。
 	const adopted = harness(t, [question({ id: "a", header: "甲" }), question({ id: "b", header: "乙" })], 24, 80);
-	adopted.input(DOWN, DOWN, ENTER);
+	adopted.input(DOWN, DOWN);
 	adopted.input("自", "己", "写", ENTER); // 采用 → 推进到第二题
 	adopted.input(BACK_TAB); // 回第一题看列表
 	assert.ok(adopted.plain().includes("自己写"), "采用后显示正文");
@@ -488,9 +406,10 @@ test("空格落在 Chat 行上同样是「先聊」，不会把它当成一个�
 test("单选：选了普通项之后，已采用的 Other 不能留在答案里", async (t) => {
 	const questions = [question({ id: "a", header: "甲" }), question({ id: "b", header: "乙", question: "第二题" })];
 	const card = harness(t, questions, 24, 80);
-	card.input(DOWN, DOWN, ENTER); // 进 Other 编辑
-	card.input("补", "充", ENTER); // 采用 → 推进到第二题
-	card.input(BACK_TAB); // 回第一题
+	card.input(DOWN, DOWN); // 移到 Other 行
+	card.input("补", "充", ENTER); // 打字 + 采用 → 推进到第二题
+	card.input(BACK_TAB); // 回第一题（焦点还停在 Other 行上）
+	card.input("\x1b[A"); // 先离开 Other 行——在它上面按数字是打字，不是选项编号
 	card.input("1"); // 数字键直选 A —— 它必须顶掉 Other
 	card.input(ENTER); // 第二题确认 → 提交屏
 	card.input(ENTER); // 提交
@@ -532,7 +451,7 @@ test("焦点走到最后一项时窗口保留上下文，不塌成一项", (t) =
 
 test("长粘贴还原全文可编辑，原生撤销仍可撤回整个粘贴", async (t) => {
 	const card = harness(t, [question()], 24, 80);
-	card.input(DOWN, DOWN, ENTER, `\x1b[200~${"x".repeat(1100)}\x1b[201~`);
+	card.input(DOWN, DOWN, `\x1b[200~${"x".repeat(1100)}\x1b[201~`);
 	card.input("\x1b[D", "\x7f", "z");
 	card.input(ENTER);
 	const result = (await card.result) as { kind: string; responses?: Record<string, string> };
@@ -542,7 +461,7 @@ test("长粘贴还原全文可编辑，原生撤销仍可撤回整个粘贴", as
 
 test("编辑态撤销粘贴不产生粘贴标记残留", async (t) => {
 	const card = harness(t, [question()], 24, 80);
-	card.input(DOWN, DOWN, ENTER, "prefix", `\x1b[200~${"x".repeat(1100)}\x1b[201~`, "\x1b[45;5u", ENTER);
+	card.input(DOWN, DOWN, "prefix", `\x1b[200~${"x".repeat(1100)}\x1b[201~`, "\x1b[45;5u", ENTER);
 	const result = (await card.result) as { kind: string; responses?: Record<string, string> };
 	assert.equal(result.kind, "answered");
 	assert.equal(result.responses?.q, "prefix");
@@ -550,19 +469,19 @@ test("编辑态撤销粘贴不产生粘贴标记残留", async (t) => {
 
 test("中文、emoji 和组合字符按完整字素删除", async (t) => {
 	const card = harness(t, [question()], 24, 80);
-	card.input(DOWN, DOWN, ENTER, "中文😀é", "\x7f", "\x7f", ENTER);
+	card.input(DOWN, DOWN, "中文😀é", "\x7f", "\x7f", ENTER);
 	assert.deepEqual(await card.result, { kind: "answered", answers: { q: "中文" }, responses: { q: "中文" } });
 });
 
 test("粘贴中的控制字节不取消或提交卡片", async (t) => {
 	const card = harness(t, [question()], 24, 80);
-	card.input(DOWN, DOWN, ENTER, "\x1b[200~a", "\x1b", "\r\nb\x03", "\x1b[201~", ENTER);
+	card.input(DOWN, DOWN, "\x1b[200~a", "\x1b", "\r\nb\x03", "\x1b[201~", ENTER);
 	assert.deepEqual(await card.result, { kind: "answered", answers: { q: "a\nb" }, responses: { q: "a\nb" } });
 });
 
 test("窄矮屏编辑仍有可见光标，长输入可向前翻到开头", (t) => {
 	const card = harness(t, [question()], 12, 40);
-	card.input(DOWN, DOWN, ENTER, `\x1b[200~${Array.from({ length: 30 }, (_, i) => `line-${i}`).join("\n")}\x1b[201~`);
+	card.input(DOWN, DOWN, `\x1b[200~${Array.from({ length: 30 }, (_, i) => `line-${i}`).join("\n")}\x1b[201~`);
 	// CURSOR_MARKER 是 APC 转义序列，会被 stripTerminalSequences 抹掉——这一条要看原始帧。
 	const raw = card.component().render(40);
 	assert.ok(raw.length <= 8, `卡片不该超过上限：${raw.length}`);
@@ -675,4 +594,26 @@ test("普通项上打字不误开编辑器", async (t) => {
 	card.input("你", "好");
 	assert.ok(!card.plain().includes("你好"), "焦点在普通项上打字不该开 Other 编辑器");
 	assert.ok(card.plain().includes("❯ 1. A"), "焦点应留在原地");
+});
+
+// —— 终端按键编码：整卡只有 Other 行行内编辑器接得到这两种，别的路径一律丢弃 ——
+
+test("终端把按键编成 kitty CSI-u 时，Other 行照样收得到", async (t) => {
+	const card = harness(t, [question()], 24, 80);
+	card.input(DOWN, DOWN);
+	card.input("\x1b[97u", "\x1b[98u"); // kitty 编码的 a、b
+	assert.ok(card.plain().includes("Other: ab"), `CSI-u 该被解码成正文：\n${card.plain()}`);
+	card.input(ENTER);
+	const outcome = (await card.result) as { responses?: Record<string, string> };
+	assert.equal(outcome.responses?.q, "ab");
+});
+
+test("终端把按键编成 modifyOtherKeys 时，Other 行照样收得到", async (t) => {
+	const card = harness(t, [question()], 24, 80);
+	card.input(DOWN, DOWN);
+	card.input("\x1b[27;1;97~"); // modifyOtherKeys 编码的 a
+	assert.ok(card.plain().includes("Other: a"), `modifyOtherKeys 该被解码：\n${card.plain()}`);
+	card.input(ENTER);
+	const outcome = (await card.result) as { responses?: Record<string, string> };
+	assert.equal(outcome.responses?.q, "a");
 });

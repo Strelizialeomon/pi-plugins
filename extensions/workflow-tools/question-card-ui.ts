@@ -8,14 +8,8 @@ import type { CardOutcome, Pick, QuestionSpec } from "./question-card.ts";
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
 
-/** 预览原始长度上限：超过就整块不渲染（对齐上游的 2000 字符门槛）。 */
-export const MAX_PREVIEW_CHARS = 2000;
 /** 列表可见项上限（对齐上游默认值 5）。 */
 export const VISIBLE_ITEMS = 5;
-/** 并排布局的宽度门槛：30 列选项栏 + 4 列间距 + 20 列最小预览宽。 */
-export const SPLIT_MIN_COLUMNS = 54;
-export const OPTION_COLUMN_WIDTH = 30;
-export const COLUMN_GAP = 4;
 /** 卡片总高上限相对终端行数的余量：给宿主留底部 4 行（沿用上一版）。 */
 const SCREEN_RESERVE = 4;
 
@@ -107,9 +101,6 @@ interface QuestionState {
 	cursor: number;
 }
 
-/** 当前编辑态：改 Other、还是改备注。 */
-type Editing = "other" | "notes";
-
 /** One bounded component works in both regular and fullscreen custom() slots. */
 export class QuestionCard implements Component, Focusable {
 	readonly #questions: QuestionSpec[];
@@ -124,8 +115,10 @@ export class QuestionCard implements Component, Focusable {
 	#focused = false;
 	/** 当前屏：0..n-1 是题目，n 是提交屏。 */
 	#index = 0;
+	/** 备注用的模态编辑器（按 n 打开）。 */
 	#editor?: FullTextEditor;
-	#editing?: Editing;
+	/** Other 行的行内编辑器：焦点落在 Other 上时存在，走开就写回草稿并丢弃。 */
+	#otherEd?: FullTextEditor;
 	#listScroll = 0;
 	#error = "";
 	#closed = false;
@@ -161,8 +154,8 @@ export class QuestionCard implements Component, Focusable {
 	#question(): QuestionSpec { return this.#questions[this.#index]!; }
 	#state(): QuestionState { return this.#states[this.#index]!; }
 	#isSubmit(): boolean { return this.#index === this.#questions.length; }
-	/** 列表项：0..options-1 是普通项，最后一项是 Other。 */
-	#isOther(): boolean { return this.#state().cursor === this.#question().options.length; }
+	/** 列表项：0..options-1 是普通项，最后一项是 Other。提交屏没有当前题，恒为 false。 */
+	#isOther(): boolean { return !this.#isSubmit() && this.#state().cursor === this.#question().options.length; }
 	#itemCount(): number { return this.#question().options.length + 1; }
 	#matches(data: string, action: Keybinding): boolean { return this.#keys.matches(data, action); }
 	#valid(state: QuestionState): boolean { return state.chosen.size > 0 || Boolean(state.other?.trim()); }
@@ -173,13 +166,11 @@ export class QuestionCard implements Component, Focusable {
 		return this.#questions.map((question, i) => {
 			const state = this.#states[i]!;
 			const selected = [...state.chosen].map((index) => question.options[index]!.label);
-			const preview = [...state.chosen].map((index) => question.options[index]!.preview).find((value) => value !== undefined);
 			const notes = state.notes.trim();
 			return {
 				id: question.id,
 				selected,
 				...(state.other ? { other: state.other } : {}),
-				...(preview !== undefined ? { preview } : {}),
 				...(notes ? { notes } : {}),
 			};
 		});
@@ -191,6 +182,7 @@ export class QuestionCard implements Component, Focusable {
 		this.#signal?.removeEventListener("abort", this.#onAbort);
 		this.focused = false;
 		this.#editor = undefined;
+		this.#otherEd = undefined;
 		for (const state of this.#states) {
 			state.draft = "";
 			state.other = undefined;
@@ -203,10 +195,10 @@ export class QuestionCard implements Component, Focusable {
 	dispose(): void { this.#finish(undefined); }
 
 	#goto(index: number): void {
+		this.#dropOtherEditor();
 		this.#index = index;
 		this.#error = "";
 		this.#editor = undefined;
-		this.#editing = undefined;
 		this.#listScroll = 0;
 	}
 
@@ -236,11 +228,6 @@ export class QuestionCard implements Component, Focusable {
 	#confirm(): void {
 		const state = this.#state();
 		const question = this.#question();
-		if (this.#isOther()) {
-			if (state.other) this.#advance();
-			else this.#edit("other");
-			return;
-		}
 		if (!question.multiSelect) {
 			// 单选：普通项与已采用的 Other 互斥，选中普通项就把 Other 正文丢掉。
 			state.chosen = new Set([state.cursor]);
@@ -262,11 +249,6 @@ export class QuestionCard implements Component, Focusable {
 			this.#finish({ kind: "chat" });
 			return;
 		}
-		if (this.#isOther()) {
-			if (this.#question().multiSelect && state.other) state.other = undefined;
-			else this.#edit("other");
-			return;
-		}
 		if (this.#question().multiSelect) {
 			if (state.chosen.has(state.cursor)) state.chosen.delete(state.cursor);
 			else state.chosen.add(state.cursor);
@@ -276,8 +258,8 @@ export class QuestionCard implements Component, Focusable {
 		}
 	}
 
-	#edit(which: Editing): FullTextEditor {
-		const theme: EditorTheme = {
+	#editorTheme(): EditorTheme {
+		return {
 			borderColor: (text) => this.#theme.fg("borderAccent", text),
 			selectList: {
 				selectedPrefix: (text) => this.#theme.fg("accent", text),
@@ -287,47 +269,71 @@ export class QuestionCard implements Component, Focusable {
 				noMatch: (text) => this.#theme.fg("warning", text),
 			},
 		};
+	}
+
+	/** 备注编辑器是模态的：按 n 打开，Enter 采用，Esc 退回。 */
+	#editNotes(): FullTextEditor {
 		const state = this.#state();
-		const editor = new FullTextEditor(this.#tui, theme);
-		editor.setText(which === "other" ? state.draft : state.notes);
+		const editor = new FullTextEditor(this.#tui, this.#editorTheme());
+		editor.setText(state.notes);
 		editor.focused = this.focused;
 		editor.onSubmit = (value) => {
-			if (which === "notes") {
-				state.notes = value;
-				this.#editor = undefined;
-				this.#editing = undefined;
-				this.#error = "";
-				this.#refresh();
-				return;
-			}
-			if (!value.trim()) {
-				editor.setText(state.draft);
-				this.#error = "请输入非空答案。";
-				return;
-			}
-			state.draft = value;
-			state.other = value.trim();
-			if (!this.#question().multiSelect) state.chosen.clear();
+			state.notes = value;
 			this.#editor = undefined;
-			this.#editing = undefined;
 			this.#error = "";
-			this.#advance();
+			this.#refresh();
 		};
 		this.#editor = editor;
-		this.#editing = which;
 		return editor;
 	}
 
-	#leaveEdit(): void {
+	#leaveNotes(): void {
 		const state = this.#state();
 		const editor = this.#editor;
 		if (!editor) return;
-		if (this.#editing === "notes") state.notes = editor.getExpandedText();
-		else state.draft = editor.getExpandedText();
+		state.notes = editor.getExpandedText();
 		editor.focused = false;
 		this.#editor = undefined;
-		this.#editing = undefined;
 		this.#error = "";
+	}
+
+	/**
+	 * Other 行的行内编辑器：它复用 Pi 的编辑器做输入解码与编辑
+	 * （kitty CSI-u / modifyOtherKeys 这些终端编码、粘贴、IME、字素安全都靠它），
+	 * 渲染时只取它的内容行、不画边框，文字直接接在 `Other: ` 后面。
+	 */
+	#otherEditor(): FullTextEditor {
+		if (!this.#otherEd) {
+			const editor = new FullTextEditor(this.#tui, this.#editorTheme());
+			editor.setText(this.#state().draft);
+			editor.focused = this.#focused;
+			this.#otherEd = editor;
+		}
+		return this.#otherEd;
+	}
+
+	/** 把行内编辑器的内容写回草稿并丢弃它（离开 Other 行时调用）。 */
+	#dropOtherEditor(): void {
+		if (!this.#otherEd) return;
+		this.#state().draft = this.#otherEd.getExpandedText();
+		this.#otherEd.focused = false;
+		this.#otherEd = undefined;
+	}
+
+	/** Enter 落在 Other 行上：采用正文并确认本题；空输入报错停下。 */
+	#adoptOther(): void {
+		const state = this.#state();
+		const value = (this.#otherEd?.getExpandedText() ?? state.draft).trim();
+		if (!value) {
+			this.#error = "请输入非空答案。";
+			this.#refresh();
+			return;
+		}
+		state.draft = value;
+		state.other = value;
+		if (!this.#question().multiSelect) state.chosen.clear();
+		this.#error = "";
+		this.#advance();
 	}
 
 	handleInput(data: string): void {
@@ -335,18 +341,48 @@ export class QuestionCard implements Component, Focusable {
 		if (this.#editor) {
 			const editor = this.#editor;
 			if (!editor.isPasting && matchesKey(data, Key.escape)) {
-				this.#leaveEdit();
+				this.#leaveNotes();
 			} else {
 				editor.handleInput(data);
-				if (this.#editor === editor && !this.#closed) {
-					const state = this.#state();
-					if (this.#editing === "notes") state.notes = editor.getExpandedText();
-					else state.draft = editor.getExpandedText();
-				}
+				if (this.#editor === editor && !this.#closed) this.#state().notes = editor.getExpandedText();
 			}
 			this.#refresh();
 			return;
 		}
+
+		// 焦点落在 Other 行：导航键归卡片，其余输入全交给行内编辑器。
+		// 自己写「只认裸字符」的判断会漏掉终端的按键编码（kitty CSI-u / modifyOtherKeys），
+		// 用户实测就是那样彻底打不进字——交给 Pi 的编辑器解码才认。
+		if (!this.#isSubmit() && this.#isOther()) {
+			const pasting = this.#otherEd?.isPasting === true;
+			if (!pasting && this.#matches(data, "tui.select.cancel")) {
+				this.#finish(undefined);
+				return;
+			}
+			if (this.#matches(data, "tui.select.up") || this.#matches(data, "tui.select.down")) {
+				const state = this.#state();
+				const count = this.#itemCount() + (this.#hasChat() ? 1 : 0);
+				state.cursor = (state.cursor + (this.#matches(data, "tui.select.up") ? count - 1 : 1)) % count;
+				this.#dropOtherEditor();
+				this.#refresh();
+				return;
+			}
+			if (this.#questions.length > 1 && (this.#matches(data, "tui.input.tab") || matchesKey(data, Key.shift("tab")))) {
+				const count = this.#questions.length + 1;
+				this.#goto((this.#index + (matchesKey(data, Key.shift("tab")) ? count - 1 : 1)) % count);
+				return;
+			}
+			if (this.#matches(data, "tui.select.confirm")) {
+				this.#adoptOther();
+				return;
+			}
+			const editor = this.#otherEditor();
+			editor.handleInput(data);
+			this.#state().draft = editor.getExpandedText();
+			this.#refresh();
+			return;
+		}
+		this.#dropOtherEditor();
 
 		if (this.#matches(data, "tui.select.cancel")) {
 			this.#finish(undefined);
@@ -375,7 +411,7 @@ export class QuestionCard implements Component, Focusable {
 			const count = this.#questions.length + 1;
 			this.#goto((this.#index + (back ? count - 1 : 1)) % count);
 		} else if (data === "n" && !this.#isSubmit()) {
-			this.#edit("notes");
+			this.#editNotes();
 		} else if (this.#isSubmit()) {
 			if (this.#matches(data, "tui.select.confirm")) this.#submit();
 			// 提交屏内容放不下时靠上下键翻看，边界由渲染时夹取。
@@ -391,28 +427,14 @@ export class QuestionCard implements Component, Focusable {
 				return;
 			}
 			this.#confirm();
-		} else if (!this.#isSubmit() && this.#isOther() && this.#isTyping(data)) {
-			// 上游的 Other 就是个内联输入框：打字（或粘贴）直接落到它上面，不需要先按 Enter。
-			// 走到这里说明这一下输入没被任何已绑定按键吃掉，是真正的正文输入。
-			const editor = this.#edit("other");
-			editor.handleInput(data);
-			this.#state().draft = editor.getExpandedText();
-			this.#refresh();
-			return;
 		}
 		this.#refresh();
-	}
-
-	/** 这一下输入是「打字 / 粘贴」而不是某个按键：只在这一层兜底里用。 */
-	#isTyping(data: string): boolean {
-		if (data.startsWith(PASTE_START)) return true;
-		return !data.includes("\x1b") && data.length > 0 && data.charCodeAt(0) >= 32;
 	}
 
 	/** 光标停在 Chat 行上（只有单选才有这一项，编号接在 Other 之后）。 */
 	#isChat(): boolean { return this.#hasChat() && this.#state().cursor === this.#itemCount(); }
 
-	invalidate(): void { this.#editor?.invalidate(); }
+	invalidate(): void { this.#editor?.invalidate(); this.#otherEd?.invalidate(); }
 
 	#wrap(text: string, width: number, prefix = ""): string[] {
 		const indent = visibleWidth(prefix);
@@ -520,7 +542,7 @@ export class QuestionCard implements Component, Focusable {
 	}
 
 	/** 选项列表：`❯ 1. 标签 ✔`（多选带前置方框），描述另起一行。按「项」分组返回，供窗口切分。 */
-	#optionItems(width: number): string[][] {
+	#optionItems(width: number, editorRows: number = VISIBLE_ITEMS): string[][] {
 		const question = this.#question();
 		const state = this.#state();
 		const g = this.#glyphs;
@@ -531,24 +553,41 @@ export class QuestionCard implements Component, Focusable {
 		for (let index = 0; index < this.#itemCount(); index++) {
 			const bucket: string[] = [];
 			items.push(bucket);
-			const other = index === question.options.length;
-			const selected = other ? Boolean(state.other) : state.chosen.has(index);
 			const focused = state.cursor === index;
 			const pointer = focused ? theme.fg("accent", g.pointer) : " ";
 			const number = theme.fg("dim", `${index + 1}.`.padEnd(indexWidth));
+			const prefix = `${pointer} ${number} `;
+
+			if (index === question.options.length) {
+				// Other 行本身就是输入框：文字直接接在 `Other: ` 后面，不弹边框编辑器。
+				const head = "Other: ";
+				if (focused) {
+					const indent = visibleWidth(prefix) + visibleWidth(head);
+					const all = this.#otherEditor().render(Math.max(1, width - indent)).slice(1, -1);
+					// 长输入只显示光标附近的一段：把光标钉在窗口里，别让它跑出屏幕。
+					const budget = Math.max(1, Math.min(editorRows, VISIBLE_ITEMS));
+					const at = Math.max(0, all.findIndex((line) => line.includes(CURSOR_MARKER)));
+					const start = Math.max(0, Math.min(at - budget + 1, all.length - budget));
+					const lines = all.slice(start, start + budget);
+					bucket.push(prefix + head + (lines[0] ?? ""), ...lines.slice(1).map((line) => " ".repeat(indent) + line));
+				} else {
+					const placeholder = question.multiSelect ? "Type something" : "Type something.";
+					const body = state.draft ? theme.fg("success", this.#clean(state.draft)) : theme.fg("dim", placeholder);
+					bucket.push(...this.#wrap(`${head}${body}`, width, prefix));
+				}
+				continue;
+			}
+
+			const selected = state.chosen.has(index);
 			const mark = question.multiSelect ? `${selected ? theme.fg("success", g.boxOn) : g.boxOff} ` : "";
-			const label = other ? `Other${!state.other && state.draft ? " · 草稿" : ""}` : this.#clean(question.options[index]!.label);
+			const label = this.#clean(question.options[index]!.label);
 			const title = selected ? theme.fg("success", theme.bold(label)) : focused ? theme.fg("accent", label) : theme.fg("text", label);
 			const tick = !question.multiSelect && selected ? ` ${theme.fg("success", g.tick)}` : "";
-			const prefix = `${pointer} ${number} ${mark}`;
-			bucket.push(...this.#wrap(`${title}${tick}`, width, prefix));
-			const indent = " ".repeat(visibleWidth(prefix));
-			// Other 空着时用占位文案顶上（上游的 input 项也是这么表达的），采用后换成正文。
-			const placeholder = question.multiSelect ? "Type something" : "Type something.";
-			const raw = other ? state.other : question.options[index]!.description;
-			const description = raw === undefined ? undefined : this.#clean(raw);
+			const full = `${prefix}${mark}`;
+			bucket.push(...this.#wrap(`${title}${tick}`, width, full));
+			const indent = " ".repeat(visibleWidth(full));
+			const description = this.#clean(question.options[index]!.description);
 			if (description) bucket.push(...this.#wrap(theme.fg(selected ? "success" : "muted", description), width, indent));
-			else if (other) bucket.push(...this.#wrap(theme.fg("dim", placeholder), width, indent));
 		}
 
 		if (this.#hasChat()) {
@@ -614,41 +653,6 @@ export class QuestionCard implements Component, Focusable {
 		return ` ${this.#state().cursor + 1}/${total}`;
 	}
 
-	/** 预览面板：有边框，超行剪裁并把标注插在内容之后、下边框之前。 */
-	#previewPanel(preview: string | undefined, width: number, maxLines: number): string[] {
-		const theme = this.#theme;
-		const grid = "─";
-		const ifEmpty = this.#theme.fg("muted", "（本项无预览）");
-		const clean = preview === undefined ? undefined : this.#clean(preview);
-		const body = clean === undefined
-			? [ifEmpty]
-			: clean.length > MAX_PREVIEW_CHARS
-				? this.#wrap(theme.fg("muted", "（预览过长，无法完整显示——请直接比较各选项的标签与描述）"), Math.max(1, width - 4))
-				: this.#wrap(clean, Math.max(1, width - 4));
-
-		const inner = Math.max(1, width - 4);
-		const interiorBudget = Math.max(1, maxLines - 2);
-		const clipped = body.length > interiorBudget;
-		const keep = clipped ? Math.max(0, interiorBudget - 1) : body.length;
-		const visible = body.slice(0, keep);
-		const hidden = body.length - keep;
-
-		const top = theme.fg("borderMuted", `┌${grid.repeat(Math.max(0, width - 2))}┐`);
-		const bottom = theme.fg("borderMuted", `└${grid.repeat(Math.max(0, width - 2))}┘`);
-		const lines = [top];
-		for (const line of visible) {
-			const pad = " ".repeat(Math.max(0, inner - visibleWidth(line)));
-			lines.push(`${theme.fg("borderMuted", "│")} ${line}${pad} ${theme.fg("borderMuted", "│")}`);
-		}
-		if (clipped) {
-			const marker = this.#ellipsize(hiddenMarker(hidden), Math.max(0, width - 2));
-			const pad = grid.repeat(Math.max(0, width - 2 - visibleWidth(marker)));
-			lines.push(theme.fg("warning", `├${marker}${pad}┤`));
-		}
-		lines.push(bottom);
-		return lines;
-	}
-
 	/** 提交屏：逐题列出答案，缺项标出。 */
 	#submitRows(width: number): string[] {
 		const g = this.#glyphs;
@@ -684,9 +688,9 @@ export class QuestionCard implements Component, Focusable {
 		const theme = this.#theme;
 		let text: string;
 		if (this.#editor) {
-			text = this.#editing === "notes"
-				? `${this.#key("tui.input.submit")} 采用  Esc 返回  ${this.#allKeys("tui.input.newLine")} 换行`
-				: `${this.#key("tui.input.submit")} 确认  Esc 返回  ${this.#allKeys("tui.input.newLine")} 换行`;
+			text = `${this.#key("tui.input.submit")} 采用 · Esc 返回 · ${this.#allKeys("tui.input.newLine")} 换行`;
+		} else if (this.#isOther()) {
+			text = `${this.#key("tui.select.confirm")} 采用 · 直接打字 · ${this.#scrollKeys()} 离开 · ${this.#key("tui.select.cancel")} 取消`;
 		} else if (this.#isSubmit()) {
 			text = `${this.#key("tui.select.confirm")} 提交 · ${this.#scrollKeys()} 翻看 · ${this.#key("tui.input.tab")} 返回 · ${this.#key("tui.select.cancel")} 取消`;
 		} else {
@@ -709,7 +713,7 @@ export class QuestionCard implements Component, Focusable {
 		const footer = this.#footer(width);
 
 		if (this.#editor) {
-			const head = this.#wrap(theme.fg("accent", theme.bold(this.#editing === "notes" ? "备注" : `[${this.#index + 1}/${this.#questions.length}] ${this.#question().header}`)), width);
+			const head = this.#wrap(theme.fg("accent", theme.bold(`[${this.#index + 1}/${this.#questions.length}] 备注`)), width);
 			const rendered = this.#editor.render(width);
 			const content = rendered.slice(1, -1);
 			const cursor = Math.max(0, content.findIndex((line) => line.includes(CURSOR_MARKER)));
@@ -728,25 +732,9 @@ export class QuestionCard implements Component, Focusable {
 		if (question.hidden > 0) questionLines.push(this.#marker(width, question.hidden));
 
 		const contentHeight = Math.max(1, bodyBudget - questionLines.length);
-		const split = !this.#isSubmit() && !this.#question().multiSelect && this.#question().options.some((option) => option.preview !== undefined) && width >= SPLIT_MIN_COLUMNS;
 
 		let content: string[];
-		if (split) {
-			const leftWidth = OPTION_COLUMN_WIDTH;
-			const rightWidth = Math.max(1, width - leftWidth - COLUMN_GAP);
-			const items = this.#optionItems(leftWidth);
-			const focused = this.#state().cursor;
-			// 左栏放不下就按项滚动，跟随焦点；右栏超限交给面板自己剪并标注。
-			const left = this.#window(items, focused, contentHeight, leftWidth).rows;
-			const preview = this.#isChat() ? undefined : this.#question().options[focused]?.preview;
-			const right = this.#previewPanel(preview, rightWidth, contentHeight);
-			content = [];
-			for (let i = 0; i < contentHeight; i++) {
-				const cell = left[i] ?? "";
-				const pad = " ".repeat(Math.max(0, leftWidth - visibleWidth(cell)));
-				content.push(`${cell}${pad}${" ".repeat(COLUMN_GAP)}${right[i] ?? ""}`);
-			}
-		} else {
+		{
 			if (this.#isSubmit()) {
 				// 提交屏按行滚动（不受「最多 5 项」的列表窗口约束）：放不下时末行换成标注，
 				// 缺项不能静默消失，↑↓ 可以往下翻。
@@ -758,12 +746,8 @@ export class QuestionCard implements Component, Focusable {
 				const below = all.length - this.#listScroll - visible.length;
 				content = below > 0 && visible.length > 1 ? [...visible.slice(0, -1), this.#marker(width, below)] : visible;
 			} else {
-				const items = this.#optionItems(width);
-				const preview = !this.#question().multiSelect ? this.#question().options[this.#state().cursor]?.preview : undefined;
-				const panel = preview !== undefined ? this.#previewPanel(preview, width, Math.max(3, Math.min(contentHeight, 6))) : [];
-				const listHeight = Math.max(1, contentHeight - panel.length);
-				const list = this.#window(items, this.#state().cursor, listHeight, width).rows.slice(0, listHeight);
-				content = [...list, ...panel];
+				const items = this.#optionItems(width, contentHeight);
+				content = this.#window(items, this.#state().cursor, contentHeight, width).rows.slice(0, contentHeight);
 			}
 		}
 

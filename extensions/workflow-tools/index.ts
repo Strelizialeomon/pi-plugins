@@ -113,8 +113,8 @@ export default function (pi: ExtensionAPI) {
 			label: "Ask user question",
 			description:
 				"向用户提 1～4 个结构化选择题并拿到答案。需要用户拍板时用它，别用普通文本提问。每题必须给一个 id，答案以 id 为 key。" +
-				"Other 与 Chat about this 由卡片自己提供，别自己加这两项。卡片会按终端尺寸排布：超屏的题目、描述、预览、备注会被剪掉并在卡上标注剪掉了几行，" +
-				"preview 超过 2000 字符干脆不显示——要用户读到全文就把内容写短，或拆成多题。" +
+				"Other 与 Chat about this 由卡片自己提供，别自己加这两项。卡片按终端尺寸排布：超屏的题目、描述、备注会被剪掉并标注剪掉了几行——" +
+				"要用户读到全文就把内容写短，或拆成多题。" +
 				"摆 spec-flow 审核档位卡时，调用方要把「文档检查：绿 / 红+摘要 / 无入口」和「N 份 × 该档 = X 个 agent / Y 分钟」两行写进相关问题的 description——卡片不会替你补。",
 			parameters: Type.Object({
 				questions: Type.Array(
@@ -127,8 +127,7 @@ export default function (pi: ExtensionAPI) {
 							Type.Object({
 								label: Type.String({ description: "简短选项文案" }),
 								description: Type.String({ description: "选项说明" }),
-								preview: Type.Optional(Type.String({ description: "聚焦时展示的辅助预览" })),
-							}),
+								}),
 							{ description: "2～4 个选项" },
 						),
 					}),
