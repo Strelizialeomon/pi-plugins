@@ -263,7 +263,7 @@ test("TUI 卡片：Chat about this 走完整链路返回 chat，不留下候选�
 	card!.handleInput("\r");
 
 	const result = await pending;
-	assert.equal(textOf(result), JSON.stringify({ kind: "chat" }));
+	assert.equal(textOf(result), JSON.stringify({ kind: "chat", answers: {} }));
 });
 
 test("TUI 卡片：备注随答案进入 annotations，不污染 answers", async () => {

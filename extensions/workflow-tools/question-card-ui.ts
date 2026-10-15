@@ -20,7 +20,10 @@ export const COLUMN_GAP = 4;
 const SCREEN_RESERVE = 4;
 
 /** 键名里这几个人话化后更好认；其余按键名首字母大写即可。 */
-const NAMED_KEYS: Record<string, string> = { pageUp: "PgUp", pageDown: "PgDn", escape: "Esc", enter: "Enter", tab: "Tab", space: "Space" };
+const NAMED_KEYS: Record<string, string> = {
+	pageUp: "PgUp", pageDown: "PgDn", escape: "Esc", enter: "Enter", tab: "Tab", space: "Space",
+	up: "↑", down: "↓", left: "←", right: "→",
+};
 
 /**
  * 两套字形：Unicode 档与简易回退档。
@@ -238,7 +241,11 @@ export class QuestionCard implements Component, Focusable {
 			else this.#edit("other");
 			return;
 		}
-		if (!question.multiSelect) state.chosen = new Set([state.cursor]);
+		if (!question.multiSelect) {
+			// 单选：普通项与已采用的 Other 互斥，选中普通项就把 Other 正文丢掉。
+			state.chosen = new Set([state.cursor]);
+			state.other = undefined;
+		}
 		if (!this.#valid(state)) {
 			this.#error = "请选择一项或填写 Other。";
 			return;
@@ -370,6 +377,9 @@ export class QuestionCard implements Component, Focusable {
 			this.#edit("notes");
 		} else if (this.#isSubmit()) {
 			if (this.#matches(data, "tui.select.confirm")) this.#submit();
+			// 提交屏内容放不下时靠上下键翻看，边界由渲染时夹取。
+			else if (this.#matches(data, "tui.select.up")) this.#listScroll = Math.max(0, this.#listScroll - 1);
+			else if (this.#matches(data, "tui.select.down")) this.#listScroll += 1;
 		} else if (this.#matches(data, "tui.select.up") || this.#matches(data, "tui.select.down")) {
 			const state = this.#state();
 			const count = this.#itemCount() + (this.#hasChat() ? 1 : 0);
@@ -393,6 +403,24 @@ export class QuestionCard implements Component, Focusable {
 		const indent = visibleWidth(prefix);
 		if (indent >= width) return wrapTextWithAnsi(prefix + text, width);
 		return wrapTextWithAnsi(text, width - indent).map((line, index) => `${index === 0 ? prefix : " ".repeat(indent)}${line}`);
+	}
+
+	/**
+	 * 清洗外部原文（模型给的题目 / 标签 / 描述 / 预览，用户敲的 Other 与备注）：
+	 * 先剥掉 ANSI 序列，再把剩下的控制字符压成空格——制表符在真终端里会撑乱列对齐，
+	 * 而裸 ESC 能让外部文本自己上色。
+	 * ⚠️ 只能在套主题色**之前**用；`#wrap` 收到的是已经上过色的串，那里不能做这件事。
+	 */
+	#clean(text: string): string {
+		// 保留 \n（0x0a）：显式换行是正文的一部分，压平它会把预览挤成一整段。
+		return stripTerminalSequences(text).replace(/[\t\r\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, " ");
+	}
+
+	/** 上下键的提示串：宿主改绑后跟着变，默认渲染成 `↑↓`。 */
+	#scrollKeys(): string {
+		const up = this.#key("tui.select.up");
+		const down = this.#key("tui.select.down");
+		return up === "↑" && down === "↓" ? "↑↓" : `${up}/${down}`;
 	}
 
 	/** 键名按宿主配置渲染，不写死——用户换过绑定后底栏提示仍然是真的。 */
@@ -420,7 +448,7 @@ export class QuestionCard implements Component, Focusable {
 		if (this.#questions.length <= 1) return [];
 		const g = this.#glyphs;
 		const theme = this.#theme;
-		const labels = this.#questions.map((q) => q.header || `Q${this.#questions.indexOf(q) + 1}`);
+		const labels = this.#questions.map((q) => this.#clean(q.header) || `Q${this.#questions.indexOf(q) + 1}`);
 		const submit = ` ${g.tick} 提交 `;
 		const left = "← ";
 		const right = " →";
@@ -434,22 +462,27 @@ export class QuestionCard implements Component, Focusable {
 			return this.#isSubmit() && index === this.#questions.length ? theme.fg("accent", text) : theme.fg("muted", text);
 		};
 
+		// 每格除了标签还有方框（2 列）和一个空格；格与格之间再留 2 列。
+		const OVERHEAD = 3;
+		const GAP = 2;
+		const total = (list: string[]) => list.reduce((sum, text, i) => sum + visibleWidth(text) + (i > 0 ? GAP : 0), 0);
+
 		let parts: string[];
 		const natural = labels.map((label, i) => cell(label, i));
-		const naturalWidth = natural.reduce((sum, text, i) => sum + visibleWidth(text) + (i > 0 ? 2 : 0), 0);
-		if (naturalWidth <= room) {
+		if (total(natural) <= room) {
 			parts = natural;
 		} else {
-			// 压缩：当前题最多占一半，其余每项至少 6 列。
-			const half = Math.max(6, Math.floor(room / 2));
-			const others = Math.max(1, this.#questions.length - 1);
-			const each = Math.max(6, Math.floor((room - half) / others));
+			// 压缩：当前题最多占可用宽一半（够用就不占满），其余每项平分剩下的，都留着方框的位置。
+			const usable = room - GAP * (labels.length - 1);
+			const want = Math.max(OVERHEAD + 1, Math.min(visibleWidth(labels[this.#index]!) + OVERHEAD, Math.floor(usable / 2)));
+			const others = Math.max(1, labels.length - 1);
+			const each = Math.max(OVERHEAD + 1, Math.floor((usable - want) / others));
 			parts = labels.map((label, i) => {
-				const budget = i === this.#index ? half : each;
-				return cell(this.#ellipsize(label, Math.max(1, budget - 4)), i);
+				const budget = i === this.#index ? want : each;
+				return cell(this.#ellipsize(label, Math.max(1, budget - OVERHEAD)), i);
 			});
 		}
-		if (room <= 0 || parts.reduce((sum, text, i) => sum + visibleWidth(text) + (i > 0 ? 2 : 0), 0) > room) {
+		if (room <= 0 || total(parts) > room) {
 			// 兜底：只留当前题，标签回退 Q{n} 并截到 3 列。
 			const at = Math.min(this.#index, this.#questions.length - 1);
 			parts = [cell(`Q${at + 1}`.slice(0, 3), at)];
@@ -489,7 +522,7 @@ export class QuestionCard implements Component, Focusable {
 			const pointer = focused ? theme.fg("accent", g.pointer) : " ";
 			const number = theme.fg("dim", `${index + 1}.`.padEnd(indexWidth));
 			const mark = question.multiSelect ? `${selected ? theme.fg("success", g.boxOn) : g.boxOff} ` : "";
-			const label = other ? `Other${!state.other && state.draft ? " · 草稿" : ""}` : question.options[index]!.label;
+			const label = other ? `Other${!state.other && state.draft ? " · 草稿" : ""}` : this.#clean(question.options[index]!.label);
 			const title = selected ? theme.fg("success", theme.bold(label)) : focused ? theme.fg("accent", label) : theme.fg("text", label);
 			const tick = !question.multiSelect && selected ? ` ${theme.fg("success", g.tick)}` : "";
 			const prefix = `${pointer} ${number} ${mark}`;
@@ -497,7 +530,8 @@ export class QuestionCard implements Component, Focusable {
 			const indent = " ".repeat(visibleWidth(prefix));
 			// Other 空着时用占位文案顶上（上游的 input 项也是这么表达的），采用后换成正文。
 			const placeholder = question.multiSelect ? "Type something" : "Type something.";
-			const description = other ? state.other : question.options[index]!.description;
+			const raw = other ? state.other : question.options[index]!.description;
+			const description = raw === undefined ? undefined : this.#clean(raw);
 			if (description) bucket.push(...this.#wrap(theme.fg(selected ? "success" : "muted", description), width, indent));
 			else if (other) bucket.push(...this.#wrap(theme.fg("dim", placeholder), width, indent));
 		}
@@ -516,29 +550,24 @@ export class QuestionCard implements Component, Focusable {
 	 * 列表窗口：最多 `VISIBLE_ITEMS` 项、且总行数不超过可用高度，焦点项必须在窗口内。
 	 * 窗口只随焦点移动，不给独立翻页键（上游同样没有）。
 	 */
-	#window(items: string[][], focusItem: number, height: number, maxItems = VISIBLE_ITEMS): { start: number; rows: string[] } {
+	#window(items: string[][], focusItem: number, height: number, width: number, maxItems = VISIBLE_ITEMS): { start: number; rows: string[] } {
 		// 单项自己也超高的（比如一条很长的描述）按可用高度剪掉并标注，不能让一个选项把卡片撑破。
 		const weigh = (bucket: string[]) => Math.min(bucket.length, height);
+		const budgetOf = (from: number, to: number) => items.slice(from, to).reduce((sum, bucket) => sum + weigh(bucket), 0);
+
 		let start = Math.max(0, Math.min(this.#listScroll, Math.max(0, items.length - 1)));
 		if (focusItem < start) start = focusItem;
 		let end = start;
-		let used = 0;
-		while (end < items.length && end - start < maxItems) {
-			const h = weigh(items[end]!);
-			if (used + h > height && end > start) break;
-			used += h;
-			end += 1;
-		}
+		while (end < items.length && end - start < maxItems && (end === start || budgetOf(start, end + 1) <= height)) end += 1;
 		if (focusItem >= end) {
+			// 焦点跑到窗口外：以它为新锚点，先往后长，再把前面能塞下的补回来——只留焦点那一项会让人失去上下文。
 			start = focusItem;
 			end = focusItem + 1;
-			used = weigh(items[focusItem]!);
-			while (end < items.length && end - start < maxItems && used + weigh(items[end]!) <= height) {
-				used += weigh(items[end]!);
-				end += 1;
-			}
+			while (end < items.length && end - start < maxItems && budgetOf(start, end + 1) <= height) end += 1;
+			while (start > 0 && end - start < maxItems && budgetOf(start - 1, end) <= height) start -= 1;
 		}
 		this.#listScroll = start;
+
 		const rows: string[] = [];
 		for (let i = start; i < end; i++) {
 			const bucket = items[i]!;
@@ -546,10 +575,20 @@ export class QuestionCard implements Component, Focusable {
 				rows.push(...bucket);
 				continue;
 			}
-			const keep = Math.max(0, height - 1);
-			rows.push(...bucket.slice(0, keep), this.#theme.fg("warning", hiddenMarker(bucket.length - keep)));
+			// 只剩一行预算时保住内容第一行（选项的标签本身永远不该被剪没），放不下标注就不放。
+			if (height <= 1) {
+				rows.push(bucket[0]!);
+				continue;
+			}
+			const keep = height - 1;
+			rows.push(...bucket.slice(0, keep), this.#marker(width, bucket.length - keep));
 		}
 		return { start, rows };
+	}
+
+	/** 剪裁标注：窄终端下也要截断到可用宽度，它自己不能溢出。 */
+	#marker(width: number, hidden: number): string {
+		return this.#theme.fg("warning", this.#ellipsize(hiddenMarker(hidden), width));
 	}
 
 	/** 列表超窗时在底栏给出位置提示；没超就是空串。 */
@@ -565,11 +604,12 @@ export class QuestionCard implements Component, Focusable {
 		const theme = this.#theme;
 		const grid = "─";
 		const ifEmpty = this.#theme.fg("muted", "（本项无预览）");
-		const body = preview === undefined
+		const clean = preview === undefined ? undefined : this.#clean(preview);
+		const body = clean === undefined
 			? [ifEmpty]
-			: preview.length > MAX_PREVIEW_CHARS
+			: clean.length > MAX_PREVIEW_CHARS
 				? this.#wrap(theme.fg("muted", "（预览过长，无法完整显示——请直接比较各选项的标签与描述）"), Math.max(1, width - 4))
-				: this.#wrap(preview, Math.max(1, width - 4));
+				: this.#wrap(clean, Math.max(1, width - 4));
 
 		const inner = Math.max(1, width - 4);
 		const interiorBudget = Math.max(1, maxLines - 2);
@@ -603,12 +643,12 @@ export class QuestionCard implements Component, Focusable {
 			const state = this.#states[i]!;
 			const done = this.#valid(state);
 			const mark = done ? theme.fg("success", g.boxOn) : theme.fg("warning", g.boxOff);
-			const header = `${mark} ${i + 1}. ${question.header || question.id}`;
+			const header = `${mark} ${i + 1}. ${this.#clean(question.header) || question.id}`;
 			rows.push(...this.#wrap(done ? theme.fg("text", header) : theme.fg("warning", header), width));
-			const answer = [...state.chosen].map((index) => question.options[index]!.label);
-			if (state.other) answer.push(state.other);
+			const answer = [...state.chosen].map((index) => this.#clean(question.options[index]!.label));
+			if (state.other) answer.push(this.#clean(state.other));
 			rows.push(...this.#wrap(done ? answer.join(", ") : "未回答", width, "  "));
-			if (state.notes.trim()) rows.push(...this.#wrap(theme.fg("muted", `备注：${state.notes.trim()}`), width, "  "));
+			if (state.notes.trim()) rows.push(...this.#wrap(theme.fg("muted", `备注：${this.#clean(state.notes.trim())}`), width, "  "));
 		});
 		if (rows.length > 0) rows.push("");
 		rows.push(...this.#wrap(theme.fg("muted", "整体提交后交给模型。"), width));
@@ -621,8 +661,8 @@ export class QuestionCard implements Component, Focusable {
 		const notes = this.#state().notes.trim();
 		const theme = this.#theme;
 		if (!notes) return this.#wrap(theme.fg("dim", "按 n 加备注"), width);
-		const capped = clip(this.#wrap(`${theme.fg("muted", "备注：")}${notes}`, width), 3);
-		return capped.hidden > 0 ? [...capped.lines, theme.fg("warning", hiddenMarker(capped.hidden))] : capped.lines;
+		const capped = clip(this.#wrap(`${theme.fg("muted", "备注：")}${this.#clean(notes)}`, width), 3);
+		return capped.hidden > 0 ? [...capped.lines, this.#marker(width, capped.hidden)] : capped.lines;
 	}
 
 	#footer(width: number): string[] {
@@ -633,10 +673,10 @@ export class QuestionCard implements Component, Focusable {
 				? `${this.#key("tui.input.submit")} 采用  Esc 返回  ${this.#allKeys("tui.input.newLine")} 换行`
 				: `${this.#key("tui.input.submit")} 确认  Esc 返回  ${this.#allKeys("tui.input.newLine")} 换行`;
 		} else if (this.#isSubmit()) {
-			text = `${this.#key("tui.select.confirm")} 提交  ${this.#key("tui.input.tab")} 返回  ${this.#key("tui.select.cancel")} 取消`;
+			text = `${this.#key("tui.select.confirm")} 提交 · ${this.#scrollKeys()} 翻看 · ${this.#key("tui.input.tab")} 返回 · ${this.#key("tui.select.cancel")} 取消`;
 		} else {
-			const nav = this.#questions.length > 1 ? `${this.#key("tui.input.tab")}/↑↓ 导航` : "↑↓ 导航";
-			text = `Enter 选择  ${nav}${this.#positionHint()}  n 备注  ${this.#key("tui.select.cancel")} 取消`;
+			const nav = this.#questions.length > 1 ? `${this.#key("tui.input.tab")}/${this.#scrollKeys()} 导航` : `${this.#scrollKeys()} 导航`;
+			text = `${this.#key("tui.select.confirm")} 选择 · ${nav}${this.#positionHint()} · n 备注 · ${this.#key("tui.select.cancel")} 取消`;
 		}
 		const lines = this.#wrap(theme.fg("dim", text), width);
 		if (this.#error) lines.unshift(...this.#wrap(theme.fg("error", this.#error), width));
@@ -667,10 +707,10 @@ export class QuestionCard implements Component, Focusable {
 		const chrome = tabBar.length + notes.length + footer.length + 2; // +2：题目后空行 + 内容与其上下的间隔
 		const bodyBudget = Math.max(1, limit - chrome);
 		const questionCap = Math.max(1, Math.floor(bodyBudget / 3));
-		const questionBody = this.#wrap(theme.fg("text", this.#isSubmit() ? "核对答案" : this.#question().question), width);
+		const questionBody = this.#wrap(theme.fg("text", this.#isSubmit() ? "核对答案" : this.#clean(this.#question().question)), width);
 		const question = clip(questionBody, questionCap);
 		const questionLines = [...question.lines];
-		if (question.hidden > 0) questionLines.push(theme.fg("warning", hiddenMarker(question.hidden)));
+		if (question.hidden > 0) questionLines.push(this.#marker(width, question.hidden));
 
 		const contentHeight = Math.max(1, bodyBudget - questionLines.length);
 		const split = !this.#isSubmit() && !this.#question().multiSelect && this.#question().options.some((option) => option.preview !== undefined) && width >= SPLIT_MIN_COLUMNS;
@@ -682,7 +722,7 @@ export class QuestionCard implements Component, Focusable {
 			const items = this.#optionItems(leftWidth);
 			const focused = this.#state().cursor;
 			// 左栏放不下就按项滚动，跟随焦点；右栏超限交给面板自己剪并标注。
-			const left = this.#window(items, focused, contentHeight).rows;
+			const left = this.#window(items, focused, contentHeight, leftWidth).rows;
 			const preview = this.#isChat() ? undefined : this.#question().options[focused]?.preview;
 			const right = this.#previewPanel(preview, rightWidth, contentHeight);
 			content = [];
@@ -692,19 +732,36 @@ export class QuestionCard implements Component, Focusable {
 				content.push(`${cell}${pad}${" ".repeat(COLUMN_GAP)}${right[i] ?? ""}`);
 			}
 		} else {
-			const submit = this.#isSubmit();
-			const items = submit ? this.#submitRows(width).map((row) => [row]) : this.#optionItems(width);
-			const preview = !submit && !this.#question().multiSelect ? this.#question().options[this.#state().cursor]?.preview : undefined;
-			const panel = preview !== undefined ? this.#previewPanel(preview, width, Math.max(3, Math.min(contentHeight, 6))) : [];
-			const listHeight = Math.max(1, contentHeight - panel.length);
-			// 提交屏按行滚动，不受「最多 5 项」的列表窗口约束。
-			const list = this.#window(items, submit ? 0 : this.#state().cursor, listHeight, submit ? Number.POSITIVE_INFINITY : VISIBLE_ITEMS).rows.slice(0, listHeight);
-			content = [...list, ...panel];
+			if (this.#isSubmit()) {
+				// 提交屏按行滚动（不受「最多 5 项」的列表窗口约束）：放不下时末行换成标注，
+				// 缺项不能静默消失，↑↓ 可以往下翻。
+				const all = this.#submitRows(width);
+				const capacity = Math.max(1, contentHeight);
+				const maxStart = Math.max(0, all.length - capacity);
+				this.#listScroll = Math.max(0, Math.min(this.#listScroll, maxStart));
+				const visible = all.slice(this.#listScroll, this.#listScroll + capacity);
+				const below = all.length - this.#listScroll - visible.length;
+				content = below > 0 && visible.length > 1 ? [...visible.slice(0, -1), this.#marker(width, below)] : visible;
+			} else {
+				const items = this.#optionItems(width);
+				const preview = !this.#question().multiSelect ? this.#question().options[this.#state().cursor]?.preview : undefined;
+				const panel = preview !== undefined ? this.#previewPanel(preview, width, Math.max(3, Math.min(contentHeight, 6))) : [];
+				const listHeight = Math.max(1, contentHeight - panel.length);
+				const list = this.#window(items, this.#state().cursor, listHeight, width).rows.slice(0, listHeight);
+				content = [...list, ...panel];
+			}
 		}
 
 		// 内容区按预算预留了高度，两栏都短时会留一圈空白——卡片高度要跟内容走，不是跟预算走。
 		while (content.length > 0 && stripTerminalSequences(content.at(-1)!).trim() === "") content.pop();
 		const blank = content.length > 0 ? [""] : [];
-		return [...tabBar, ...questionLines, ...blank, ...content, ...notes, ...footer];
+		const out = [...tabBar, ...questionLines, ...blank, ...content, ...notes, ...footer];
+		// 极小终端下各段的 `max(1, …)` 下限加起来可能超过上限：先丢备注，再硬压到上限，
+		// 保证「卡片总高 ≤ 终端行数 − 4」在任何尺寸下都成立。
+		if (out.length > limit) {
+			const trimmed = [...tabBar, ...questionLines, ...blank, ...content, ...footer];
+			return trimmed.length > limit ? trimmed.slice(0, limit) : trimmed;
+		}
+		return out;
 	}
 }

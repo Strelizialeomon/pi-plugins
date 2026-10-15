@@ -57,8 +57,8 @@ export type CardOutcome = { kind: "picks"; picks: Pick[] } | { kind: "chat" };
 
 export const CANCELLED = { kind: "cancelled" } as const;
 export const BUSY = { kind: "busy" } as const;
-/** 用户没作答，选择先讨论——答案与草稿都不保留。 */
-export const CHAT = { kind: "chat" } as const;
+/** 用户没作答，选择先讨论——答案与草稿都不保留；`answers` 按结果契约恒在，只是空。 */
+export const CHAT = { kind: "chat", answers: {} } as const;
 
 export function uiUnavailable(mode: string) {
 	return { kind: "ui_unavailable", mode } as const;

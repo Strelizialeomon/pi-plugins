@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { getKeybindings, KeybindingsManager, stripTerminalSequences, TUI_KEYBINDINGS, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, getKeybindings, KeybindingsManager, stripTerminalSequences, TuiAltScreen, TuiMainScreen, TUI_KEYBINDINGS, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { askQuestions, type CardOutcome, type QuestionSpec } from "./question-card.ts";
 import { FALLBACK_GLYPHS, pickGlyphs, UNICODE_GLYPHS, VISIBLE_ITEMS } from "./question-card-ui.ts";
@@ -341,7 +341,7 @@ test("单选提供 Chat，选中后返回 chat 且不留下答案", async (t) =>
 	card.input(SPACE); // 先选一项，确认它不会混进结果
 	card.input(DOWN, DOWN, DOWN); // 走到 Chat 行（A、B、Other、Chat）
 	card.input(ENTER);
-	assert.deepEqual(await card.result, { kind: "chat" });
+	assert.deepEqual(await card.result, { kind: "chat", answers: {} });
 });
 
 test("多选与提交屏都没有 Chat", async (t) => {
@@ -480,5 +480,171 @@ test("空格落在 Chat 行上同样是「先聊」，不会把它当成一个�
 	const card = harness(t, [question()], 24, 80);
 	card.input(DOWN, DOWN, DOWN); // 走到 Chat 行
 	card.input(SPACE);
-	assert.deepEqual(await card.result, { kind: "chat" });
+	assert.deepEqual(await card.result, { kind: "chat", answers: {} });
+});
+
+// —— 对抗式审核抓到的回归（每条都对着一个具体复现路径） ——
+
+test("单选：选了普通项之后，已采用的 Other 不能留在答案里", async (t) => {
+	const questions = [question({ id: "a", header: "甲" }), question({ id: "b", header: "乙", question: "第二题" })];
+	const card = harness(t, questions, 24, 80);
+	card.input(DOWN, DOWN, ENTER); // 进 Other 编辑
+	card.input("补", "充", ENTER); // 采用 → 推进到第二题
+	card.input(BACK_TAB); // 回第一题
+	card.input("1"); // 数字键直选 A —— 它必须顶掉 Other
+	card.input(ENTER); // 第二题确认 → 提交屏
+	card.input(ENTER); // 提交
+	const outcome = (await card.result) as { answers: Record<string, string>; responses?: Record<string, string> };
+	assert.deepEqual(outcome.answers, { a: "A", b: "A" });
+	assert.equal(outcome.responses, undefined, "Other 已被普通项顶掉，不该再出现在 responses 里");
+});
+
+test("40×12 多题：选项列表不会被整块剪没，至少保住标签行", (t) => {
+	const card = harness(t, [question(), question({ id: "b", header: "乙", question: "第二题" })], 12, 40);
+	const frame = card.lines(40);
+	assert.ok(frame.some((line) => line.includes("1. A")), `至少要看得见选项标签：\n${frame.join("\n")}`);
+	card.assertFits(40);
+});
+
+test("提交屏放不下时给剪裁标注，且能上下翻到最后一条", (t) => {
+	const questions = [question({ id: "a", header: "甲" }), question({ id: "b", header: "乙" }), question({ id: "c", header: "丙" })];
+	const card = harness(t, questions, 12, 80);
+	card.input(ENTER, ENTER, ENTER); // 三题各答第一项 → 提交屏
+	assert.ok(card.plain().includes("核对答案"));
+	assert.ok(!card.plain().includes("3. 丙"), "第三题确实放不下");
+	assert.ok(card.plain().includes("✂"), "放不下要标注，不能静默丢弃");
+	card.input(DOWN, DOWN, DOWN, DOWN);
+	assert.ok(card.plain().includes("3. 丙"), "↓ 要能翻到最后一条");
+});
+
+test("焦点走到最后一项时窗口保留上下文，不塌成一项", (t) => {
+	const card = harness(t, [question({
+		options: [{ label: "甲", description: "" }, { label: "乙", description: "" }, { label: "丙", description: "" }, { label: "丁", description: "" }],
+	})], 24, 80);
+	for (let i = 0; i < 5; i++) card.input(DOWN);
+	const frame = card.lines(80);
+	assert.ok(frame.some((line) => line.includes("❯ 6. Chat about this")), "焦点应在末项");
+	const items = frame.filter((line) => /^\s*(❯ )?\d\./.test(line));
+	assert.equal(items.length, VISIBLE_ITEMS, `窗口该留住 ${VISIBLE_ITEMS} 项：\n${frame.join("\n")}`);
+});
+
+// —— 上一版就有、本轮重写测试时被漏掉的两块覆盖（编辑器粘贴与浮层补偿） ——
+
+test("长粘贴还原全文可编辑，原生撤销仍可撤回整个粘贴", async (t) => {
+	const card = harness(t, [question()], 24, 80);
+	card.input(DOWN, DOWN, ENTER, `\x1b[200~${"x".repeat(1100)}\x1b[201~`);
+	card.input("\x1b[D", "\x7f", "z");
+	card.input(ENTER);
+	const result = (await card.result) as { kind: string; responses?: Record<string, string> };
+	assert.equal(result.kind, "answered");
+	assert.equal(result.responses?.q, `${"x".repeat(1098)}zx`);
+});
+
+test("编辑态撤销粘贴不产生粘贴标记残留", async (t) => {
+	const card = harness(t, [question()], 24, 80);
+	card.input(DOWN, DOWN, ENTER, "prefix", `\x1b[200~${"x".repeat(1100)}\x1b[201~`, "\x1b[45;5u", ENTER);
+	const result = (await card.result) as { kind: string; responses?: Record<string, string> };
+	assert.equal(result.kind, "answered");
+	assert.equal(result.responses?.q, "prefix");
+});
+
+test("中文、emoji 和组合字符按完整字素删除", async (t) => {
+	const card = harness(t, [question()], 24, 80);
+	card.input(DOWN, DOWN, ENTER, "中文😀é", "\x7f", "\x7f", ENTER);
+	assert.deepEqual(await card.result, { kind: "answered", answers: { q: "中文" }, responses: { q: "中文" } });
+});
+
+test("粘贴中的控制字节不取消或提交卡片", async (t) => {
+	const card = harness(t, [question()], 24, 80);
+	card.input(DOWN, DOWN, ENTER, "\x1b[200~a", "\x1b", "\r\nb\x03", "\x1b[201~", ENTER);
+	assert.deepEqual(await card.result, { kind: "answered", answers: { q: "a\nb" }, responses: { q: "a\nb" } });
+});
+
+test("窄矮屏编辑仍有可见光标，长输入可向前翻到开头", (t) => {
+	const card = harness(t, [question()], 12, 40);
+	card.input(DOWN, DOWN, ENTER, `\x1b[200~${Array.from({ length: 30 }, (_, i) => `line-${i}`).join("\n")}\x1b[201~`);
+	// CURSOR_MARKER 是 APC 转义序列，会被 stripTerminalSequences 抹掉——这一条要看原始帧。
+	const raw = card.component().render(40);
+	assert.ok(raw.length <= 8, `卡片不该超过上限：${raw.length}`);
+	assert.ok(raw.some((line) => line.includes(CURSOR_MARKER)), "编辑态必须有可见光标");
+});
+
+const STUB_TERMINAL = {
+	columns: 80, rows: 24, kittyProtocolActive: false,
+	start() {}, stop() {}, async drainInput() {}, write() { return ""; },
+	moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {},
+};
+
+/**
+ * 按 Pi 的真实挂法走一遍：`ui.custom(factory, options)` 收到什么就照做什么。
+ * 只测卡片自己处理按键是不够的——关闭路径走的是宿主浮层栈，挂法错了会留下死浮层。
+ */
+function mountedCard(t: TestContext, TuiClass: typeof TuiAltScreen | typeof TuiMainScreen, questions: QuestionSpec[]) {
+	const tui = new TuiClass(STUB_TERMINAL as never, false);
+	let component!: Component & { dispose?(): void };
+	let close!: (value: CardOutcome | undefined) => void;
+	const ctx = {
+		mode: "tui", hasUI: true,
+		ui: {
+			custom(factory: (tui: TUI, theme: Theme, keys: KeybindingsManager, done: (value: CardOutcome | undefined) => void) => typeof component, options?: { overlay?: boolean; overlayOptions?: unknown; onHandle?: (handle: unknown) => void }) {
+				return new Promise<CardOutcome | undefined>((resolve) => {
+					close = (value) => {
+						if (options?.overlay) tui.hideOverlay();
+						resolve(value);
+					};
+					component = factory(tui as unknown as TUI, { fg: (_c: string, text: string) => text, bold: (text: string) => text } as Theme, getKeybindings(), close);
+					if (options?.overlay) options.onHandle?.(tui.showOverlay(component, options.overlayOptions as never));
+					else { tui.addChild(component); tui.setFocus(component); }
+				});
+			},
+		},
+	} as unknown as ExtensionContext;
+	const controller = new AbortController();
+	const result = askQuestions(ctx, questions, controller.signal);
+	t.after(async () => { controller.abort(); await result; });
+	return { tui, abort: () => controller.abort(), result };
+}
+
+test("关闭时宿主浮层压在上面，卡片条目也不能留在浮层栈里", async (t) => {
+	const card = mountedCard(t, TuiAltScreen, [question()]);
+	// 模拟答题期间用户打开了 Pi 自己的浮层（全屏转录搜索），此时卡片被中止。
+	// 关闭必须由卡片自己发起：命中 Pi 的 close 后它弹的是「栈顶那条」。
+	card.tui.showOverlay({ render: () => [""], invalidate() {}, handleInput() {} }, { width: 10 });
+	assert.equal(card.tui.hasOverlay(), true);
+	card.abort();
+	await card.result;
+	assert.equal(card.tui.hasOverlay(), false, "残留的死浮层会让全屏视口键一直让路，且只有重启能恢复");
+});
+
+test("卡片自己的颜色序列不被破坏，外部文本里的转义序列会被剥掉", async (t) => {
+	// 这条必须用会真吐 ANSI 的主题：恒等主题下「ESC 被清洗吃掉」是看不出来的
+	// （真机上表现为整卡颜色变成可见的 `[39m`）。
+	let component!: Component & { focused?: boolean; dispose?(): void };
+	const theme = {
+		fg: (color: string, text: string) => `\x1b[${color === "accent" ? "36" : "39"}m${text}\x1b[39m`,
+		bold: (text: string) => `\x1b[1m${text}\x1b[22m`,
+	} as Theme;
+	const tui = { terminal: { rows: 24, columns: 80 }, requestRender() {} } as unknown as TUI;
+	const ctx = {
+		mode: "tui", hasUI: true,
+		ui: { custom(factory: (tui: TUI, theme: Theme, kb: KeybindingsManager, done: (v: CardOutcome | undefined) => void) => Component) {
+			return new Promise<CardOutcome | undefined>((resolve) => {
+				component = factory(tui, theme, getKeybindings(), resolve);
+				component.focused = true;
+			});
+		} },
+	} as unknown as ExtensionContext;
+	const controller = new AbortController();
+	const result = askQuestions(ctx, [question({
+		question: "题\x1b[31m红",
+		options: [{ label: "A\x1b[32m绿", description: "" }, { label: "B", description: "" }],
+	})], controller.signal);
+	t.after(async () => { controller.abort(); component.dispose?.(); await result; });
+
+	const raw = component.render(80).join("\n");
+	const plain = stripTerminalSequences(raw);
+	assert.ok(raw.includes("\x1b[36m"), "焦点光标的强调色序列应完整保留");
+	assert.ok(!plain.includes("[36m") && !plain.includes("[39m"), `不该有被截断的转义序列残留：${plain}`);
+	assert.ok(!raw.includes("\x1b[31m") && !raw.includes("\x1b[32m"), "外部文本里的转义序列不能穿进渲染");
+	assert.ok(plain.includes("题红") && plain.includes("A绿"), "剥掉转义后正文要留着");
 });
