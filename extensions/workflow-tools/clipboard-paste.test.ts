@@ -29,7 +29,7 @@ function harvester() {
 test("文件优先级最高：剪贴板里是文件时，只有路径被插入，图片与文本都不看", async () => {
 	const { r, calls } = reader({ files: ["/tmp/a.png", "/tmp/b.txt"], image: PNG, text: "不该用到" });
 	const out = await pasteFromClipboard({ reader: r });
-	assert.deepEqual(out, { kind: "insert", text: "/tmp/a.png\n/tmp/b.txt" });
+	assert.deepEqual(out, { kind: "insert", text: "/tmp/a.png\n/tmp/b.txt", source: "files" });
 	assert.deepEqual(calls, ["files"]);
 });
 
@@ -37,7 +37,7 @@ test("图片次之：落成临时文件后插入路径，文本不看", async ()
 	const { r, calls } = reader({ files: null, image: PNG, text: "不该用到" });
 	const { written, writeFile } = harvester();
 	const out = await pasteFromClipboard({ reader: r, writeFile, tmpDir: "/tmp/x", id: () => "abc" });
-	assert.deepEqual(out, { kind: "insert", text: "/tmp/x/pi-clipboard-abc.png" });
+	assert.deepEqual(out, { kind: "insert", text: "/tmp/x/pi-clipboard-abc.png", source: "image" });
 	assert.deepEqual(calls, ["files", "image"]);
 	assert.equal(written.length, 1);
 	assert.deepEqual(written[0]!.bytes, PNG, "写出去的字节要和剪贴板里的一致");
@@ -45,7 +45,7 @@ test("图片次之：落成临时文件后插入路径，文本不看", async ()
 
 test("文本最次：前面都没有才插文本", async () => {
 	const { r, calls } = reader({ files: null, image: null, text: "一段文字" });
-	assert.deepEqual(await pasteFromClipboard({ reader: r }), { kind: "insert", text: "一段文字" });
+	assert.deepEqual(await pasteFromClipboard({ reader: r }), { kind: "insert", text: "一段文字", source: "text" });
 	assert.deepEqual(calls, ["files", "image", "text"]);
 });
 
@@ -81,6 +81,7 @@ test("图片格式按字节头认，认不出来落 png", () => {
 	assert.equal(imageExtension(WEBP), "webp");
 	assert.equal(imageExtension(BMP), "bmp");
 	assert.equal(imageExtension(TIFF), "tiff");
+	assert.equal(imageExtension(new Uint8Array([0x49, 0x49, 0x2b, 0x00])), "tiff", "BigTIFF 头");
 	assert.equal(imageExtension(UNKNOWN), "png");
 	assert.equal(imageExtension(new Uint8Array()), "png", "空字节也得给个兜底");
 });

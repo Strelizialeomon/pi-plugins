@@ -30,7 +30,8 @@ export interface PasteDeps {
 }
 
 export type PasteOutcome =
-	| { kind: "insert"; text: string }
+	/** `source` 说明这份内容从哪一级取到——宿主只给文件路径补空格，卡片按它区分。 */
+	| { kind: "insert"; text: string; source: "files" | "image" | "text" }
 	| { kind: "none" }
 	| { kind: "error"; message: string };
 
@@ -51,7 +52,7 @@ export function imageExtension(bytes: Uint8Array): string {
 	if (at(0, [0x47, 0x49, 0x46, 0x38])) return "gif";
 	if (at(0, [0x52, 0x49, 0x46, 0x46]) && at(8, [0x57, 0x45, 0x42, 0x50])) return "webp";
 	if (at(0, [0x42, 0x4d])) return "bmp";
-	if (at(0, [0x49, 0x49, 0x2a, 0x00]) || at(0, [0x4d, 0x4d, 0x00, 0x2a])) return "tiff";
+	if (at(0, [0x49, 0x49, 0x2a, 0x00]) || at(0, [0x4d, 0x4d, 0x00, 0x2a]) || at(0, [0x49, 0x49, 0x2b, 0x00])) return "tiff"; // 末一个是 BigTIFF
 	return "png";
 }
 
@@ -67,7 +68,7 @@ export async function pasteFromClipboard(deps: PasteDeps): Promise<PasteOutcome>
 		const paths = await reader.getFilePaths?.();
 		if (paths && paths.length > 0) {
 			if (paths.some(hasControlChars)) return { kind: "error", message: "剪贴板里的文件路径含控制字符，已拒绝。" };
-			return { kind: "insert", text: paths.join("\n") };
+			return { kind: "insert", text: paths.join("\n"), source: "files" };
 		}
 
 		const image = await reader.getImage?.();
@@ -79,11 +80,11 @@ export async function pasteFromClipboard(deps: PasteDeps): Promise<PasteOutcome>
 			} catch (error) {
 				return { kind: "error", message: `写临时图片失败：${error instanceof Error ? error.message : String(error)}` };
 			}
-			return { kind: "insert", text: file };
+			return { kind: "insert", text: file, source: "image" };
 		}
 
 		const text = await reader.getText?.();
-		if (typeof text === "string" && text.length > 0) return { kind: "insert", text };
+		if (typeof text === "string" && text.length > 0) return { kind: "insert", text, source: "text" };
 		return { kind: "none" };
 	} catch {
 		// 剪贴板读取失败（没权限、后端缺失、超时）静默忽略，别把卡片卡住。

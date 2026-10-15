@@ -375,14 +375,16 @@ export class QuestionCard implements Component, Focusable {
 		// 自己写「只认裸字符」的判断会漏掉终端的按键编码（kitty CSI-u / modifyOtherKeys），
 		// 用户实测就是那样彻底打不进字——交给 Pi 的编辑器解码才认。
 		if (!this.#isSubmit() && this.#isOther()) {
-			// 粘贴键要排在「当正文输入」前面，否则 Ctrl+V 会被当成控制字符塞进正文。
-			if (this.#matchesPasteKey(data)) {
-				void this.#pasteFromClipboard();
-				return;
-			}
 			const pasting = this.#otherEd?.isPasting === true;
+			// 取消键先于粘贴键：宿主若把粘贴绑成 ctrl+c，用户按下去该取消就取消，不能被粘贴吃掉。
 			if (!pasting && this.#matches(data, "tui.select.cancel")) {
 				this.#finish(undefined);
+				return;
+			}
+			// 粘贴键要排在「当正文输入」前面，否则单字节 Ctrl+V 会被当成正文处理。
+			// （注意只挡得住单字节：多字符块夹着控制字节仍会原样进正文，与宿主主输入框同姿势。）
+			if (this.#matchesPasteKey(data)) {
+				void this.#pasteFromClipboard().catch(() => {});
 				return;
 			}
 			if (this.#matches(data, "tui.select.up") || this.#matches(data, "tui.select.down")) {
@@ -471,8 +473,13 @@ export class QuestionCard implements Component, Focusable {
 
 	/** 从剪贴板取一次内容插进行内编辑器（文件路径 / 图片落盘后的路径 / 文本）。 */
 	async #pasteFromClipboard(): Promise<void> {
+		// 读剪贴板是异步的（原生模块在工作线程上跑）。await 期间用户可能切题、进提交屏、
+		// 甚至关掉卡片——那时这次粘贴已经没有落点了。少了这道闸，提交屏上 #state() 会取到
+		// undefined 并抛错，而这是个没人接的 promise，pi 的兜底会把整个进程 exit(1)。
+		const index = this.#index;
 		const outcome = await pasteFromClipboard(this.#pasteDeps);
-		if (this.#closed || outcome.kind === "none") return;
+		if (this.#closed || this.#index !== index || this.#isSubmit() || !this.#isOther()) return;
+		if (outcome.kind === "none") return;
 		if (outcome.kind === "error") {
 			this.#error = outcome.message;
 			this.#refresh();
@@ -483,7 +490,9 @@ export class QuestionCard implements Component, Focusable {
 		const line = editor.getText().split("\n")[cursor.line] ?? "";
 		const before = cursor.col > 0 ? (line[cursor.col - 1] ?? "") : "";
 		const after = line[cursor.col] ?? "";
-		editor.insertTextAtCursor(paddedForCursor(outcome.text, before, after));
+		// 补空格只给文件路径：宿主就是这么分的（图片与文本分支直接插，不补）。
+		const text = outcome.source === "files" ? paddedForCursor(outcome.text, before, after) : outcome.text;
+		editor.insertTextAtCursor(text);
 		const draft = editor.getExpandedText();
 		this.#state().draft = draft;
 		this.#error = "";
