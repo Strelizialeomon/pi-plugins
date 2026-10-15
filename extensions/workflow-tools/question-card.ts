@@ -52,8 +52,13 @@ export interface AnsweredResult {
 	annotations?: Record<string, Annotation>;
 }
 
+/** 卡片结束时交回来的东西：一批答案，或者「用户想先聊」。 */
+export type CardOutcome = { kind: "picks"; picks: Pick[] } | { kind: "chat" };
+
 export const CANCELLED = { kind: "cancelled" } as const;
 export const BUSY = { kind: "busy" } as const;
+/** 用户没作答，选择先讨论——答案与草稿都不保留。 */
+export const CHAT = { kind: "chat" } as const;
 
 export function uiUnavailable(mode: string) {
 	return { kind: "ui_unavailable", mode } as const;
@@ -198,11 +203,12 @@ export function buildAnsweredResult(input: { picks: Pick[] }): AnsweredResult {
 // —— 接线层：TUI 卡片 / RPC 降级 / 无 UI 兜底 ——
 
 const OTHER_LABEL = "Other";
+const CHAT_LABEL = "Chat about this";
 const DONE_LABEL = "✓ 选完了";
 const CANCEL_LABEL = "✗ 取消";
 
 /** 卡片与 RPC 降级自己要用这些文案，模型不能再拿它们当选项 label。 */
-const RESERVED_LABELS = [OTHER_LABEL, DONE_LABEL, CANCEL_LABEL];
+const RESERVED_LABELS = [OTHER_LABEL, CHAT_LABEL, DONE_LABEL, CANCEL_LABEL];
 
 /** 同一会话同时只允许一张活动卡片。并发调用直接拿到 busy。 */
 let cardOpen = false;
@@ -259,12 +265,11 @@ async function askViaRpc(
 }
 
 /**
- * 卡片要挂成铺满终端的浮层，不是因为好看：全屏模式下 Pi 会先把 PageUp/PageDown 交给自己的
- * 对话区滚动，只有聚焦中的浮层能拿到这套键（`TuiAltScreen.handleViewportInput` 里
- * `shouldDeferViewportInputToOverlay` 一条）。挂在编辑槽里的普通组件拿不到，翻页会静默失效。
- * 常规模式两种挂法都能收到，统一走浮层以免两套路径。
+ * 卡片挂成浮层：编辑槽的高度由宿主按它自己的状态栏和编辑器算，卡片拿不到稳定预算；
+ * 浮层宽度铺满、高度按卡片实际渲染行数（`maxHeight` 只是上限），常规与全屏两种模式走同一条路径。
  *
- * 代价（已写进 README 与规格）：浮层期间宿主自己的视口滚动键也一并让给卡片，答题时滚不动转录。
+ * 代价（README 与规格里写明）：浮层期间宿主自己的视口滚动键也让给卡片，答题时滚不动转录。
+ * 上一版为「浮层才能拿到 PageUp/PageDown」而挂浮层的理由已随裁剪机制取消，本版不再提供翻页键。
  */
 export const QUESTION_CARD_MOUNT = {
 	overlay: true,
@@ -279,7 +284,7 @@ export async function askQuestions(
 	ctx: ExtensionContext,
 	questions: QuestionSpec[],
 	signal?: AbortSignal,
-): Promise<AnsweredResult | typeof CANCELLED | typeof BUSY | ReturnType<typeof uiUnavailable>> {
+): Promise<AnsweredResult | typeof CANCELLED | typeof BUSY | typeof CHAT | ReturnType<typeof uiUnavailable>> {
 	if (cardOpen) return BUSY;
 	if (ctx.mode !== "tui" && !ctx.hasUI) return uiUnavailable(ctx.mode);
 	if (signal?.aborted) return CANCELLED;
@@ -288,20 +293,21 @@ export async function askQuestions(
 	let card: QuestionCard | undefined;
 	let overlay: OverlayHandle | undefined;
 	try {
-		let picks: Pick[] | undefined;
-
 		if (ctx.mode === "tui") {
-			picks = await ctx.ui.custom<Pick[] | undefined>(
+			const outcome = await ctx.ui.custom<CardOutcome | undefined>(
 				(tui, theme, keybindings, done) => {
 					card = new QuestionCard(questions, tui, theme, keybindings, done, signal);
 					return card;
 				},
 				{ ...QUESTION_CARD_MOUNT, onHandle: (handle) => { overlay = handle; } },
 			);
-		} else {
-			picks = await askViaRpc(ctx, questions, signal);
+			if (outcome === undefined) return CANCELLED;
+			if (outcome.kind === "chat") return CHAT;
+			return buildAnsweredResult({ picks: outcome.picks });
 		}
 
+		// RPC 只有单值 select，没有 Chat 出口，也不产出备注。
+		const picks = await askViaRpc(ctx, questions, signal);
 		if (picks === undefined) return CANCELLED;
 		return buildAnsweredResult({ picks });
 	} finally {

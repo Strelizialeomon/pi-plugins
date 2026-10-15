@@ -46,7 +46,11 @@ export function renderTaskResult(headline: string, tail: string[] = []): Compone
 	return textBlock(lines);
 }
 
-/** The question receipt wraps full answers without changing the other tools. */
+/**
+ * 问答回执：一行头 + 每题一条 `· 问题 → 答案`。
+ * 答案在转录里会被长期保留，所以长答案截断到一行；完整答案仍由结构化结果交给模型。
+ * 只调整问答工具，其他三个工具的显示不受影响。
+ */
 export function renderQuestionResult(
 	result: { content: Array<{ type?: string; text?: string }>; details?: unknown; isError?: boolean },
 	theme: Theme,
@@ -60,8 +64,12 @@ export function renderQuestionResult(
 				lines.push(theme.fg("success", theme.bold(`已回答 ${Object.keys(details.answers).length} 题`)));
 				for (const [id, answer] of Object.entries(details.answers)) {
 					const header = questions.find((question) => question.id === id)?.header || id;
-					lines.push(theme.fg("accent", `${header}：`), answer);
+					// 换行会被压平：回执是「一行一条」，答案里的换行不能把行数撑开。
+					const flat = answer.replace(/\s+/g, " ").trim();
+					lines.push(theme.fg("muted", truncateToWidth(`· ${header} → ${flat}`, width, "…")));
 				}
+			} else if (details?.kind === "chat") {
+				lines.push(theme.fg("muted", truncateToWidth("用户选择先讨论，未作答。", width, "…")));
 			} else {
 				const status = details?.kind;
 				const label = status === "cancelled" ? "已取消" : status === "busy" ? "已有活动选项卡" : status === "ui_unavailable" ? `无交互界面（${details?.mode ?? "未知模式"}）` : undefined;

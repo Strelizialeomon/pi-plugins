@@ -233,6 +233,73 @@ test("TUI 卡片：方向键 + Enter 走完单选，答案以 id 为 key", async
 	assert.equal(textOf(result), JSON.stringify({ kind: "answered", answers: { tier: "重审" } }));
 });
 
+test("TUI 卡片：Chat about this 走完整链路返回 chat，不留下候选答案", async () => {
+	const { pi, tools } = makePi();
+	plugin(pi);
+
+	let card: { handleInput(data: string): void } | undefined;
+	let resolveCard: (value: unknown) => void = () => {};
+	const cardDone = new Promise((resolve) => (resolveCard = resolve));
+	const ctx = makeCtx("tui", {
+		custom: (factory: (tui: unknown, t: unknown, k: unknown, done: (v: unknown) => void) => unknown) => {
+			card = factory({ requestRender: () => {} }, undefined, undefined, resolveCard) as typeof card;
+			return cardDone;
+		},
+	});
+
+	const pending = tools.get("ask_user_question")!.execute(
+		"c1",
+		{ questions: [{ id: "q", question: "选？", header: "h", multiSelect: false, options: [{ label: "A", description: "" }, { label: "B", description: "" }] }] },
+		undefined,
+		undefined,
+		ctx,
+	);
+	await flush();
+
+	card!.handleInput(" "); // 先选一项，确认它不会混进结果
+	card!.handleInput("\x1b[B");
+	card!.handleInput("\x1b[B");
+	card!.handleInput("\x1b[B"); // A → B → Other → Chat
+	card!.handleInput("\r");
+
+	const result = await pending;
+	assert.equal(textOf(result), JSON.stringify({ kind: "chat" }));
+});
+
+test("TUI 卡片：备注随答案进入 annotations，不污染 answers", async () => {
+	const { pi, tools } = makePi();
+	plugin(pi);
+
+	let card: { handleInput(data: string): void } | undefined;
+	let resolveCard: (value: unknown) => void = () => {};
+	const cardDone = new Promise((resolve) => (resolveCard = resolve));
+	const ctx = makeCtx("tui", {
+		custom: (factory: (tui: unknown, t: unknown, k: unknown, done: (v: unknown) => void) => unknown) => {
+			card = factory({ requestRender: () => {} }, undefined, undefined, resolveCard) as typeof card;
+			return cardDone;
+		},
+	});
+
+	const pending = tools.get("ask_user_question")!.execute(
+		"c1",
+		{ questions: [{ id: "q", question: "选？", header: "h", multiSelect: false, options: [{ label: "A", description: "" }, { label: "B", description: "" }] }] },
+		undefined,
+		undefined,
+		ctx,
+	);
+	await flush();
+
+	card!.handleInput("n");
+	card!.handleInput("补");
+	card!.handleInput("充");
+	card!.handleInput("\r"); // 采用备注
+	card!.handleInput(" ");
+	card!.handleInput("\r");
+
+	const result = await pending;
+	assert.equal(textOf(result), JSON.stringify({ kind: "answered", answers: { q: "A" }, annotations: { q: { notes: "补充" } } }));
+});
+
 test("TUI 卡片：Esc 取消，且取消不伪装成选了某一项", async () => {
 	const { pi, tools } = makePi();
 	plugin(pi);
@@ -416,7 +483,7 @@ test("卡片开着时第二个调用拿到 busy，不排队不覆盖", async () 
 	]);
 	assert.deepEqual(second.details, { kind: "busy" }, "第二次调用应立刻拿到 busy，不该等前一张卡");
 
-	resolveCard([{ id: "q", selected: ["A"] }]);
+	resolveCard({ kind: "picks", picks: [{ id: "q", selected: ["A"] }] });
 	await first;
 });
 
