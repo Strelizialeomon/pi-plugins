@@ -12,7 +12,7 @@ import { defineTool, type ExtensionAPI, type ExtensionToolContext } from "@earen
 import { Type } from "typebox";
 import { askQuestions, validateQuestions } from "./question-card.ts";
 import { startShellCommand } from "./monitor.ts";
-import { renderTaskCall, renderTaskResult } from "./renderers.ts";
+import { renderQuestionResult, renderTaskCall, renderTaskResult } from "./renderers.ts";
 import {
 	applyChainStep,
 	createIsolatedWorktree,
@@ -145,9 +145,8 @@ export default function (pi: ExtensionAPI) {
 			renderCall(args) {
 				return renderTaskCall("ask_user_question", `${args.questions.length} 个问题`);
 			},
-			renderResult(result) {
-				const details = result.details as { kind?: string } | undefined;
-				return renderTaskResult(`选项卡：${details?.kind ?? "已返回"}`);
+			renderResult(result, _options, theme, context) {
+				return renderQuestionResult(result, theme, context.args.questions);
 			},
 		}),
 	);

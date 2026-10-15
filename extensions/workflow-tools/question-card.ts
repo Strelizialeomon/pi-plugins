@@ -6,8 +6,9 @@
  * - 接线层（上）：TUI / RPC 两套渲染与取值，由 `index.ts` 接进 ExtensionAPI。
  */
 
-import { Key, matchesKey, truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { OverlayHandle } from "@earendil-works/pi-tui";
+import { QuestionCard } from "./question-card-ui.ts";
 
 export type QuestionMode = "tui" | "rpc" | "json" | "print";
 
@@ -207,167 +208,6 @@ const RESERVED_LABELS = [OTHER_LABEL, DONE_LABEL, CANCEL_LABEL];
 let cardOpen = false;
 
 /**
- * TUI 卡片。键盘约定：方向键移动、空格切换多选、Enter 确认、Esc 取消。
- * 选中 `Other` 后进入自由输入，逐字符收键，Enter 提交、Esc 退回。
- */
-class QuestionCard implements Component {
-	// Node 的 TS 支持只做类型擦除，不认参数属性，字段得显式声明
-	readonly #questions: QuestionSpec[];
-	readonly #done: (picks: Pick[] | undefined) => void;
-	readonly #requestRender: () => void;
-	#index = 0;
-	#cursor = 0;
-	#chosen: Array<Set<string>>;
-	#other: Array<string | undefined>;
-	#typing = false;
-	#draft = "";
-
-	constructor(
-		questions: QuestionSpec[],
-		done: (picks: Pick[] | undefined) => void,
-		requestRender: () => void,
-	) {
-		this.#questions = questions;
-		this.#done = done;
-		this.#requestRender = requestRender;
-		this.#chosen = questions.map(() => new Set<string>());
-		this.#other = questions.map(() => undefined);
-	}
-
-	#current(): QuestionSpec {
-		return this.#questions[this.#index] as QuestionSpec;
-	}
-
-	/** 尾部固定多一个 Other 行。 */
-	#rows(): number {
-		return this.#current().options.length + 1;
-	}
-
-	#isOther(): boolean {
-		return this.#cursor === this.#current().options.length;
-	}
-
-	#commitQuestion() {
-		if (this.#index < this.#questions.length - 1) {
-			this.#index += 1;
-			this.#cursor = 0;
-			this.#requestRender();
-			return;
-		}
-
-		this.#done(
-			this.#questions.map((q, i) => {
-				const other = this.#other[i];
-				const preview = [...this.#chosen[i]]
-					.map((label) => q.options.find((option) => option.label === label)?.preview)
-					.find((value) => value !== undefined);
-				return {
-					id: q.id,
-					selected: [...(this.#chosen[i] ?? [])],
-					...(other ? { other } : {}),
-					...(preview !== undefined ? { preview } : {}),
-				};
-			}),
-		);
-	}
-
-	handleInput(data: string): void {
-		if (this.#typing) {
-			if (matchesKey(data, Key.escape)) {
-				this.#typing = false;
-				this.#draft = "";
-			} else if (matchesKey(data, Key.enter)) {
-				this.#other[this.#index] = this.#draft.trim() || undefined;
-				this.#typing = false;
-				this.#draft = "";
-				this.#commitQuestion();
-			} else if (matchesKey(data, Key.backspace)) {
-				this.#draft = this.#draft.slice(0, -1);
-			} else if (data.length === 1 && data >= " ") {
-				this.#draft += data;
-			}
-			this.#requestRender();
-			return;
-		}
-
-		if (matchesKey(data, Key.escape)) {
-			this.#done(undefined);
-			return;
-		}
-		if (matchesKey(data, Key.up)) {
-			this.#cursor = (this.#cursor - 1 + this.#rows()) % this.#rows();
-		} else if (matchesKey(data, Key.down)) {
-			this.#cursor = (this.#cursor + 1) % this.#rows();
-		} else if (matchesKey(data, Key.space)) {
-			if (this.#isOther()) {
-				this.#typing = true;
-			} else if (this.#current().multiSelect) {
-				const label = this.#current().options[this.#cursor]?.label ?? "";
-				const bucket = this.#chosen[this.#index] as Set<string>;
-				if (bucket.has(label)) bucket.delete(label);
-				else bucket.add(label);
-				this.#other[this.#index] = undefined;
-			} else {
-				const label = this.#current().options[this.#cursor]?.label ?? "";
-				this.#chosen[this.#index] = new Set([label]);
-				this.#other[this.#index] = undefined;
-			}
-		} else if (matchesKey(data, Key.enter)) {
-			if (this.#isOther()) {
-				this.#typing = true;
-			} else {
-				// 多选时 Enter 只负责确认，不再顺手把光标所在项加进去——
-				// 那样「勾了 A、移到 B 按确认」会变成 A+B。
-				if (!this.#current().multiSelect) {
-					const label = this.#current().options[this.#cursor]?.label ?? "";
-					this.#chosen[this.#index] = new Set([label]);
-					this.#other[this.#index] = undefined;
-				}
-				this.#commitQuestion();
-			}
-		} else {
-			return;
-		}
-		this.#requestRender();
-	}
-
-	invalidate(): void {
-		// 无缓存，无需失效
-	}
-
-	render(width: number): string[] {
-		const question = this.#current();
-		const bucket = this.#chosen[this.#index] as Set<string>;
-		const lines: string[] = [
-			`[${this.#index + 1}/${this.#questions.length}] ${question.header} · ${question.question}`,
-		];
-
-		for (const [i, option] of question.options.entries()) {
-			const pointer = i === this.#cursor ? "❯" : " ";
-			const mark = question.multiSelect ? (bucket.has(option.label) ? "[x]" : "[ ]") : " ";
-			const description = option.description ? `  ${option.description}` : "";
-			lines.push(`${pointer} ${mark} ${option.label}${description}`);
-		}
-
-		const otherPointer = this.#isOther() ? "❯" : " ";
-		const otherValue = this.#other[this.#index];
-		const otherText = this.#typing ? this.#draft : (otherValue ?? "");
-		lines.push(`${otherPointer}    ${OTHER_LABEL}${otherText ? `：${otherText}` : ""}`);
-
-		// 预览只跟随当前高亮的选项，且不进答案文本
-		const focused = this.#isOther() ? undefined : question.options[this.#cursor]?.preview;
-		if (focused) {
-			lines.push("─".repeat(3));
-			lines.push(...focused.split("\n"));
-			lines.push("─".repeat(3));
-		}
-
-		lines.push(this.#typing ? "输入中 —— Enter 提交 · Esc 退回" : "↑↓ 移动 · 空格 切换 · Enter 确认 · Esc 取消");
-		return lines.map((line) => truncateToWidth(line, width));
-	}
-}
-
-/**
  * RPC 只有单值 select，多选按题拆成连续单选，preview 丢弃并标 degraded。
  * `opts.signal` 必须传：客户端崩了或不回包时，只有 abort 能把 promise 落定，
  * 否则 `cardOpen` 会永久卡住，之后每次调用都返回 busy。
@@ -419,6 +259,19 @@ async function askViaRpc(
 }
 
 /**
+ * 卡片要挂成铺满终端的浮层，不是因为好看：全屏模式下 Pi 会先把 PageUp/PageDown 交给自己的
+ * 对话区滚动，只有聚焦中的浮层能拿到这套键（`TuiAltScreen.handleViewportInput` 里
+ * `shouldDeferViewportInputToOverlay` 一条）。挂在编辑槽里的普通组件拿不到，翻页会静默失效。
+ * 常规模式两种挂法都能收到，统一走浮层以免两套路径。
+ *
+ * 代价（已写进 README 与规格）：浮层期间宿主自己的视口滚动键也一并让给卡片，答题时滚不动转录。
+ */
+export const QUESTION_CARD_MOUNT = {
+	overlay: true,
+	overlayOptions: { width: "100%", maxHeight: "100%", anchor: "bottom-left", margin: 0 },
+} as const;
+
+/**
  * 三档降级：TUI 用自绘卡片，RPC 用 Pi 支持的基础选择交互，
  * JSON / print 直接返回 `ui_unavailable`——不挂着等一个不存在的终端。
  */
@@ -429,19 +282,21 @@ export async function askQuestions(
 ): Promise<AnsweredResult | typeof CANCELLED | typeof BUSY | ReturnType<typeof uiUnavailable>> {
 	if (cardOpen) return BUSY;
 	if (ctx.mode !== "tui" && !ctx.hasUI) return uiUnavailable(ctx.mode);
+	if (signal?.aborted) return CANCELLED;
 
 	cardOpen = true;
+	let card: QuestionCard | undefined;
+	let overlay: OverlayHandle | undefined;
 	try {
 		let picks: Pick[] | undefined;
 
 		if (ctx.mode === "tui") {
-			// custom() 的 Promise 在卡片调 done() 时落定，不需要自己搭闸门。
-			picks = await ctx.ui.custom<Pick[] | undefined>((tui: TUI, _theme, _keybindings, done) =>
-				new QuestionCard(
-					questions,
-					(result) => done(result),
-					() => tui.requestRender(),
-				),
+			picks = await ctx.ui.custom<Pick[] | undefined>(
+				(tui, theme, keybindings, done) => {
+					card = new QuestionCard(questions, tui, theme, keybindings, done, signal);
+					return card;
+				},
+				{ ...QUESTION_CARD_MOUNT, onHandle: (handle) => { overlay = handle; } },
 			);
 		} else {
 			picks = await askViaRpc(ctx, questions, signal);
@@ -450,6 +305,11 @@ export async function askQuestions(
 		if (picks === undefined) return CANCELLED;
 		return buildAnsweredResult({ picks });
 	} finally {
+		// Pi 关闭浮层时弹的是「栈顶那条」。若关闭瞬间上面还压着宿主自己的浮层（全屏转录搜索），
+		// 被弹掉的是它，卡片这条会永远留在栈里——全屏视口键从此一直让路给一张关掉的卡片。
+		// 这里按句柄补一次精确出栈；正常路径上它早被弹掉了，是空操作。
+		overlay?.hide();
+		card?.dispose();
 		cardOpen = false;
 	}
 }
