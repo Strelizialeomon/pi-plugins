@@ -15,7 +15,6 @@ export type QuestionMode = "tui" | "rpc" | "json" | "print";
 export interface QuestionOption {
 	label: string;
 	description: string;
-	preview?: string;
 }
 
 export interface QuestionSpec {
@@ -27,7 +26,6 @@ export interface QuestionSpec {
 }
 
 export interface Annotation {
-	preview?: string;
 	notes?: string;
 	degraded?: boolean;
 }
@@ -39,9 +37,8 @@ export interface Pick {
 	selected: string[];
 	/** 走 `Other` 自由输入时的原文。 */
 	other?: string;
-	preview?: string;
 	notes?: string;
-	/** RPC 下降级过（多选被拆成连续单选、preview 丢弃）。 */
+	/** RPC 下降级过（多选被拆成连续单选）。 */
 	degraded?: boolean;
 }
 
@@ -136,14 +133,7 @@ export function validateQuestions(raw: unknown): ValidationResult {
 			if (typeof o.description !== "string") {
 				return { ok: false, error: `${at}的第 ${optIndex + 1} 个选项缺少 \`description\`。` };
 			}
-			if (o.preview !== undefined && typeof o.preview !== "string") {
-				return { ok: false, error: `${at}的第 ${optIndex + 1} 个选项的 \`preview\` 必须是字符串。` };
-			}
-			options.push({
-				label: o.label,
-				description: o.description,
-				...(o.preview !== undefined ? { preview: o.preview } : {}),
-			});
+			options.push({ label: o.label, description: o.description });
 		}
 
 		normalized.push({
@@ -183,7 +173,6 @@ export function buildAnsweredResult(input: { picks: Pick[] }): AnsweredResult {
 		}
 
 		const annotation: Annotation = {};
-		if (pick.preview !== undefined) annotation.preview = pick.preview;
 		if (pick.notes !== undefined) annotation.notes = pick.notes;
 		if (pick.degraded !== undefined) annotation.degraded = pick.degraded;
 		if (Object.keys(annotation).length > 0) {
@@ -214,7 +203,7 @@ const RESERVED_LABELS = [OTHER_LABEL, CHAT_LABEL, DONE_LABEL, CANCEL_LABEL];
 let cardOpen = false;
 
 /**
- * RPC 只有单值 select，多选按题拆成连续单选，preview 丢弃并标 degraded。
+ * RPC 只有单值 select，多选按题拆成连续单选，并在结果里标 degraded。
  * `opts.signal` 必须传：客户端崩了或不回包时，只有 abort 能把 promise 落定，
  * 否则 `cardOpen` 会永久卡住，之后每次调用都返回 busy。
  */
