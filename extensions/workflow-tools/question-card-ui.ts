@@ -1,8 +1,9 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
-	CURSOR_MARKER, Editor, getKeybindings, Key, matchesKey, stripTerminalSequences, visibleWidth, wrapTextWithAnsi,
+	CURSOR_MARKER, Editor, getKeybindings, getNativeClipboard, Key, matchesKey, stripTerminalSequences, visibleWidth, wrapTextWithAnsi,
 	type Component, type EditorTheme, type Focusable, type Keybinding, type KeybindingsManager, type TUI,
 } from "@earendil-works/pi-tui";
+import { paddedForCursor, pasteFromClipboard, type PasteDeps } from "./clipboard-paste.ts";
 import type { CardOutcome, Pick, QuestionSpec } from "./question-card.ts";
 
 const PASTE_START = "\x1b[200~";
@@ -108,6 +109,7 @@ export class QuestionCard implements Component, Focusable {
 	readonly #theme: Theme;
 	readonly #keys: KeybindingsManager;
 	readonly #glyphs: Glyphs;
+	readonly #pasteDeps: PasteDeps;
 	readonly #done: (outcome: CardOutcome | undefined) => void;
 	readonly #states: QuestionState[];
 	readonly #signal?: AbortSignal;
@@ -131,12 +133,14 @@ export class QuestionCard implements Component, Focusable {
 		done: (outcome: CardOutcome | undefined) => void,
 		signal?: AbortSignal,
 		glyphs: Glyphs = pickGlyphs(),
+		pasteDeps: PasteDeps = { reader: getNativeClipboard() },
 	) {
 		this.#questions = questions;
 		this.#tui = tui;
 		this.#theme = theme;
 		this.#keys = keys ?? getKeybindings();
 		this.#glyphs = glyphs;
+		this.#pasteDeps = pasteDeps;
 		this.#done = done;
 		this.#signal = signal;
 		this.#states = questions.map(() => ({ chosen: new Set<number>(), draft: "", notes: "", cursor: 0 }));
@@ -371,6 +375,11 @@ export class QuestionCard implements Component, Focusable {
 		// 自己写「只认裸字符」的判断会漏掉终端的按键编码（kitty CSI-u / modifyOtherKeys），
 		// 用户实测就是那样彻底打不进字——交给 Pi 的编辑器解码才认。
 		if (!this.#isSubmit() && this.#isOther()) {
+			// 粘贴键要排在「当正文输入」前面，否则 Ctrl+V 会被当成控制字符塞进正文。
+			if (this.#matchesPasteKey(data)) {
+				void this.#pasteFromClipboard();
+				return;
+			}
 			const pasting = this.#otherEd?.isPasting === true;
 			if (!pasting && this.#matches(data, "tui.select.cancel")) {
 				this.#finish(undefined);
@@ -448,6 +457,36 @@ export class QuestionCard implements Component, Focusable {
 			}
 			this.#confirm();
 		}
+		this.#refresh();
+	}
+
+	/**
+	 * 宿主键位表里的粘贴键（`app.clipboard.pasteImage`，默认 Ctrl+V）。
+	 * 它不属于 pi-tui 的 `tui.*` 那套，类型上只能按名字匹配；
+	 * 只在焦点位于 Other 行时拦——别的位置维持现状，不动宿主的语义。
+	 */
+	#matchesPasteKey(data: string): boolean {
+		return this.#keys.matches(data, "app.clipboard.pasteImage" as Keybinding);
+	}
+
+	/** 从剪贴板取一次内容插进行内编辑器（文件路径 / 图片落盘后的路径 / 文本）。 */
+	async #pasteFromClipboard(): Promise<void> {
+		const outcome = await pasteFromClipboard(this.#pasteDeps);
+		if (this.#closed || outcome.kind === "none") return;
+		if (outcome.kind === "error") {
+			this.#error = outcome.message;
+			this.#refresh();
+			return;
+		}
+		const editor = this.#otherEditor();
+		const cursor = editor.getCursor();
+		const line = editor.getText().split("\n")[cursor.line] ?? "";
+		const before = cursor.col > 0 ? (line[cursor.col - 1] ?? "") : "";
+		const after = line[cursor.col] ?? "";
+		editor.insertTextAtCursor(paddedForCursor(outcome.text, before, after));
+		const draft = editor.getExpandedText();
+		this.#state().draft = draft;
+		this.#error = "";
 		this.#refresh();
 	}
 
