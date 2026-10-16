@@ -149,6 +149,27 @@ subagent(run_in_background: true)  → 派 reviewer；完成后运行时自动�
 
 `task_stop`：`{ task_id }`。传**已终态**的 id 返回终态快照并带 `alreadyFinished`（不算失败）；传**不存在**的 id 返回可识别的参数错误（`isError`）。
 
+## 内置插件：sticky-prompt
+
+`extensions/sticky-prompt/` 把**最近一条已完全滚出视口顶部的用户提问**常驻在 transcript 顶部一行，点它就能跳回那条消息看全文。往上继续滚，越过更早的提问时会换成更早那条；滚回底部（跟随最新输出）时它自己消失。
+
+纯展示：不写会话、不进上下文、不改任何既有行为。
+
+### 启用
+
+装进 Pi 后**默认开启**，全屏模式下自动生效，无需配置。想关掉：
+
+```
+/sticky-prompt          # 切换开关，状态存在 ~/.pi/agent/sticky-prompt.json
+```
+
+### 要知道的几条约定
+
+- **只在全屏模式生效**（`tuiMode: "fullscreen"`，Pi 的默认值）。regular 模式下终端自己管滚动、没有布局系统，插件在那里完全 inert——不注入、不报错、不告警。
+- **点击是唯一的新交互**。键盘路径是 Pi 既有的滚动键位（`tui.altScreen.*`）：滚上去就能看到全文，所以本插件不另外占键位。
+- **同装 `pi-affix-prompt` 会打架**：两者都要改根布局的 entry 顺序。本插件只保证不主动破坏别人的 entry，不保证与同类插件共存。
+- **它借了 Pi 的非公开面**（根布局的 `entries` 结构、`UserMessageComponent` 实例上的私有 `text` 字段、`dist/layout.js` 里的 `getScrollViewBox`）。所以启动时会先探一下结构：对不上就不启用并告警一次，而不是静默画错。Pi 升版后如果看到这个告警，就是该跟着更新了。
+
 ## 发布（可选）
 
 `package.json` 里现在有 `"private": true` 防手滑。要发 npm 时去掉它，并保留 `pi-package` 关键字，才能进 [Pi package gallery](https://pi.dev/packages)。
