@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import extension, { loadState, saveState, syncBar, type RootLike } from "./index.ts";
@@ -422,6 +423,24 @@ test("设置：写完能读回，且不留 .tmp 半截文件", () => {
 	assert.deepEqual(loadState(file), { enabled: false });
 	assert.deepEqual(readdirSync(dir), ["sticky-prompt.json"], "不该留下 .tmp");
 	assert.ok(readFileSync(file, "utf8").includes("false"));
+});
+
+// ------------------------------------------------------------------ 加载
+
+test("加载：能被 Pi 的真实扩展加载器加载（守「整个扩展加载失败」那类缺陷）", async () => {
+	// 这条不是形式主义：实施期重审抓到过一次——`import ... from "@earendil-works/pi-tui/dist/layout.js"`
+	// 这个深引在 jiti 的 alias 模式下会被前缀替换成 `…/pi-tui/dist/index.js/dist/layout.js`，
+	// 于是**整个扩展加载失败**（不是降级）。当时把它加回去复现，加载数就是 0。
+	// 任何让扩展加载不起来的改动，都会在这条上现形。
+	const { discoverAndLoadExtensions } = await import("@earendil-works/pi-coding-agent");
+	const here = dirname(fileURLToPath(import.meta.url));
+	const result = await discoverAndLoadExtensions(
+		[join(here, "index.ts")],
+		join(here, "..", ".."),
+		mkdtempSync(join(tmpdir(), "sticky-prompt-agent-")),
+	);
+	assert.deepEqual(result.errors, [], `加载报错：${JSON.stringify(result.errors)}`);
+	assert.equal(result.extensions.length, 1);
 });
 
 // ------------------------------------------------------------------ 接线
