@@ -2,8 +2,8 @@
 
 - 日期：2026-10-16
 - 类型：方案期 spec
-- 状态：待审
-- Issue：（待 spec 合并后开）
+- 状态：实施中（PR #21）
+- Issue：#20
 - 现状基线：`3b21a24`（main）
 - 适用环境：Pi 1.2.x 全屏终端交互模式（`tuiMode: "fullscreen"`，Pi 的默认值）
 - 前序规格：无（本文件不改任何既有规格）
@@ -36,13 +36,22 @@
 | 根布局可在运行时改写，取用点是 `tui.layoutRoot` 与 `tui.currentLayout` | `pi-tui/dist/tui-alt-screen.js:44-45` 声明 `layoutRoot;` / `currentLayout;`（`.d.ts` 里是 TS private，运行时可达）；它的 `entries` 是 `StackEntry[]`，可原地 `splice` 重排 |
 | 公开的正式接口是 `ViewportTUI.setLayoutRoot()`——但它**不是**本规格走的那条路 | `pi-tui/dist/tui.d.ts:249` `interface ViewportTUI extends TUI`、`:251` `setLayoutRoot(component: Component \| undefined): void`；`TuiAltScreen` 实现了它（`tui-alt-screen.d.ts:97`）。本规格不做「换掉整个布局根」，而是就地改 `entries` 顺序（见 §4.6） |
 
-### 2.2 行区间从哪来
+### 2.2 行区间从哪来（本规格最容易想错的一处）
+
+先把结论放前面：**布局帧给不了「哪条消息在第几行」，行区间必须自己算；而「自己算」这件事最终连缓存都不能要**（理由见下面最后两行）。
 
 | 结论 | 当场核对的依据 |
 |---|---|
-| Pi 每帧的布局帧里**带每个组件的精确行区间** | `pi-tui/dist/layout.d.ts:9-19` `interface LayoutBox { component; rect; clip; children; parent?; lines?; lineOffset?; scrollView?; scrollContentLines?; }`——`lineOffset` 即该组件相对其父的行偏移 |
-| 取帧的两个函数**可以深引拿到**（虽然不在包根公开导出里） | `pi-tui/dist/index.d.ts` 全文无这两个名字；但 `pi-tui/package.json` **没有 `exports` 字段**（只有 `main` / `types`），所以 `@earendil-works/pi-tui/dist/layout.js` 可深引，其中 `layout.d.ts:39` `getLayoutBoxesAt(frame, x, y)`、`:40` `getScrollViewBox(frame, scrollView)` |
-| 因此**不需要**自己按组件渲染高度累加行数 | 同上。自己累加要双渲染整条 transcript、还要维护缓存失效；用布局帧是零额外渲染、且与 Pi 同源 |
+| 布局帧里**只有** `Stack`（VStack/HStack）与 `ScrollView` 会产生 box | `pi-tui/dist/layout.js:50` `const node = getLayoutNode(component);`——拿不到 node 就走 `:52-67` 那条路 `return { … children: [], lines, lineOffset }`，整棵子树被拍平进 `lines`，**不产生子 box** |
+| 只有 `ScrollView` 与 `Stack` 声明了 `[LAYOUT_NODE]()` | `pi-tui/dist/components/scroll-view.d.ts:57` `[LAYOUT_NODE](): ScrollLayoutNode;`、`stack.d.ts:28` `[LAYOUT_NODE](): StackLayoutNode;`。**`Container` 没有**（`tui.js:96` 起整个类无此成员） |
+| 而四个 transcript 容器**全是裸 `Container`** | `interactive-mode.js:385-388`：`headerContainer` / `loadedResourcesContainer` / `chatContainer` / `documentContainer` 都是 `new Container()` |
+| ⇒ **帧里没有消息级 box**，`LayoutBox.children` / `lineOffset` 在消息这一层不存在 | 上三条合起来即可推出。`layout.d.ts:9-19` 的字段本身是真的，只是**没有 box 可拿** |
+| 帧**能**给、也确实有用的是：ScrollView 的 box 上带着**全量内容行** | `layout.js:89` `scrollContentLines: renderCached(context, node.component, contentWidth)`——整块内容（含视口外）的渲染结果。Pi 每帧本来就要渲染它（`renderCache` 是 `renderLayoutFrame` 每次调用新建的，`layout.js:280`），所以这份数据是白拿的 |
+| 取内容容器走**公开** `children`，不需要私有面 | `pi-tui/dist/components/scroll-view.js:27` 构造函数里 `this.children.push(component)`；`Container.children` 是公开字段（`tui.js:97`）。`ScrollView` 自己的 `private readonly child`（`scroll-view.d.ts:19`）因此**不必用** |
+| 取内容宽度也是公开的 | `pi-tui/dist/components/scroll-view.js:67` `getContentWidth(width)`（`.d.ts` 里非 private） |
+| **不要深引 `dist/layout.js`**——`import` 一个深路径会让整个扩展加载失败，不是降级 | 深引本身在 Node 解析下可行（`pi-tui/package.json` 没有 `exports` 字段，`layout.d.ts:39` `getLayoutBoxesAt`、`:40` `getScrollViewBox`），但扩展是由 jiti 加载的，而 `loader.js:471-476` 那条 **alias 分支**（非 bundle 的 Node 构建）做的是**前缀替换**：`@earendil-works/pi-tui/dist/layout.js` → `<…>/pi-tui/dist/index.js/dist/layout.js`。实测结论：alias 模式下报 `Cannot find module`、**整个扩展加载失败**；bundle 模式（本机 `dist/bundle/cli.js` 走 virtualModules）才正常。静态 `import` 没有 try/catch 可挂，所以「读不到就不做校验和」这种降级**根本到不了**。本规格因此**不用布局帧的任何东西** |
+| 于是也不需要「校验和」了——它本来是为了给高度缓存做失效判断 | 见下一条 |
+| **高度不缓存，每帧实测** | 缓存要正确就需要一个「我缓的值过时了」的信号。唯一候选是布局帧的内容总高，而它比当前帧**晚一拍**（`tui-alt-screen.js:1547` 的 `this.currentLayout = nextLayout` 在 `doRender` 末行、位于 `renderLayoutFrame` **之后**），于是「非尾块长高」（展开工具输出、思考块显隐、资源区变化）会滞后一帧才发现，而修正又要再来一帧——用户停在那儿不动读屏的整段时间里，吸顶条一直显示错的提问。这个功能存在的意义就是「显示对的那一条」，所以这里选正确性。代价与早退见 §4.2、§6 第 1 条、§10 |
 
 ### 2.3 怎么认出「用户提问」
 
@@ -60,7 +69,7 @@
 | 滚动状态与滚动操作全是**公开 API**，无需碰私有面 | `pi-tui/dist/components/scroll-view.d.ts`：`:37` `get scrollTop`、`:38` `get isFollowingEnd`、`:39` `get viewportHeight`、`:48` `scrollTo(...)`、`:49` `scrollBy(...)`、`:52` `updateLayout(...)`。（同文件 `:19` `private readonly child` 才是私有的） |
 | 扩展拿到的 `tui` 是**指向活渲染器的 Proxy**，私有成员运行时可达 | `interactive-mode.js:383` `this.ui = createInteractiveTuiReference(() => this.renderer)`；`tui-renderer.js:37` 起是 `createInteractiveTuiReference`，`:39-58` 的 `get` 陷阱里 `:41` 是 `Reflect.get(tui, property, tui)`（TS `private` 编译后不存在） |
 | 扩展的两条入口都拿到这个 Proxy | `setWidget` 的工厂：`interactive-mode.js:1881` `component = content(this.ui, theme)`；`custom` 的工厂：`:2354` `Promise.resolve(factory(this.ui, theme, this.keybindings, close))` |
-| 注入的根级 entry **会拿到自己的 layout box，能收到鼠标事件** | `tui-alt-screen.js:636-650` 的 `dispatchMouseToLayout`；「整行热区」因此可行 |
+| 注入的根级 entry **会拿到自己的 layout box，能收到鼠标事件** | `tui-alt-screen.js:634-650` 的 `dispatchMouseToLayout`；「整行热区」因此可行。全屏下点击合成的是 `click` 事件（`:1121` `createMouseEvent("click", …)`），左键由 `decodeMouseButton(0)` 给出（`:605-616`） |
 | 鼠标只在**全屏模式**路由到组件；regular 模式终端自己管滚动，且无布局系统 | `docs/tui.md`「Handle mouse input」节：`Fullscreen mode routes normalized mouse events to components.` / `Regular mode leaves mouse input to the terminal because the terminal owns scrollback.` |
 | Pi 官方要求「每个交互都要留键盘路径」 | 同节末句：`Design every interaction with a keyboard path even when fullscreen mouse input is available.` |
 
@@ -69,11 +78,18 @@
 | 结论 | 当场核对的依据 |
 |---|---|
 | 维护者确实建议「做成扩展」，原话一字不差 | `github.com/earendil-works/pi` issue #7802（**建于 2026-08-07T23:58:40Z**），维护者 badlogic 于 **2026-08-10T15:09:13Z** 回复原文：`you can do this as an extension` |
-| 但要说清：那两条 issue **都不是被人工裁决关掉的** | #7802 于创建后 **10 秒**被机器人自动关闭（`closed_at` `2026-08-07T23:58:50Z`，`state_reason: not_planned`，首条评论是 `All issues from new contributors are auto-closed by default`）；#8447（**建于 2026-08-21T15:01:40Z**）同样在 10 秒后被自动关闭，**全程只有机器人那一条评论，没有任何维护者表态**。两条的维护者动作都只是「没有重新打开」 |
+| 「关单是自动的，不是人工否决」——但**维护者并非全程沉默** | 两条都是建于/关闭于同 10 秒内（#7802 `2026-08-07T23:58:40Z` → `:50Z`、#8447 `2026-08-21T15:01:40Z` → `:50Z`，均 `state_reason: not_planned`，首条评论是 `All issues from new contributors are auto-closed by default`）。**区别在维护者有没有下场**：#7802 有 badlogic 的回复（上一行那句，2026-08-10T15:09:13Z），#8447 **只有机器人那一条评论、无任何维护者表态**。所以准确的说法是「**#7802 上维护者明确建议做成扩展；#8447 无人回应**」，而不是「两条都没被人工裁决」 |
 | 核心求小是写在贡献指南里的 | `CONTRIBUTING.md`：`PRs that bloat the core will likely be rejected.`（另有 `pi's core is minimal`） |
-| 生态里已有同类实现可作技法参考 | `npm:pi-affix-prompt`（MIT，v1.0.5）。它抓活 `tui` 靠注册一个即刻移除的 `setWidget`（`index.ts:341` `captureTui`）、钩 `ScrollView.updateLayout`（`:441`）、改 `root.entries` 顺序（`:390-430`，entry 选项在 `:414`）、纯逻辑单独放 `state-machine.ts` 便于单测 |
+| 生态里已有同类实现可作技法参考 | `npm:pi-affix-prompt`（MIT，v1.0.5）。它抓活 `tui` 靠注册一个即刻移除的 `setWidget`（`index.ts:341` `captureTui`）、钩 `ScrollView.updateLayout`（`:441`）、改 `root.entries` 顺序（`:390-430`，entry 选项在 `:409`）、纯逻辑单独放 `state-machine.ts` 便于单测 |
 
-**已经能取到、不必再当风险的一条**：行区间的来源是 Pi 自己的布局帧（§2.2），不是我们猜的。早期草稿曾写「取不到行区间 API、只能自己累加」——那是错的，已改。
+**这一节被改过三次，把来龙去脉留全**（三次都是「上一个结论被下一个实测推翻」，不是措辞调整）：
+
+1. **初稿**：「行区间 API 取不到，只能自己按组件累加。」
+2. **轻审 #2 之后**：「`getScrollViewBox` / `getLayoutBoxesAt` 其实可深引，所以走布局帧、不用自己累加。」——**错**：那两个函数拿得到，但帧里**没有消息级的 box**。
+3. **实施开工后**：「行区间自己算，布局帧的 `scrollContentLines` 只当校验和。」——仍然**留了个尾巴**：深引是静态 `import`，在 jiti 的 alias 模式下会让整个扩展**加载失败**（不是降级）。
+4. **实施期重审之后（现行）**：**不用布局帧的任何东西**；行区间自己算，且**高度不缓存、每帧实测**。
+
+第 2、3 步错在同一个地方：**只确认了「那个 API 拿得到」，没确认「拿到的够不够用」**。第 3 步还多错了一层：没确认「拿不到时会怎么坏」。这两条已写进 §11 的流程教训。
 
 ## 3. 范围
 
@@ -89,12 +105,12 @@
 
 ### 不包含
 
-- **regular 模式**（`tuiMode: "regular"`）：没有布局系统、终端持有滚动，本规格下插件完全 inert（不注入、不报错、不注册）。
+- **regular 模式**（`tuiMode: "regular"`）：没有布局系统、终端持有滚动，本规格下插件**不注入、不报错、不告警**（命令仍会注册——它不该随模式消失；在那个模式下按它只会翻转开关、不影响任何显示）。
 - **活体渲染 / peel & stick**（把原消息按 1:1 贴上去、主题与 markdown 全跟随）：用户选的是「摘要式」。
 - **多行吸顶**：吸顶行恒为 1 行或 0 行。
 - **把吸顶内容写进模型上下文**：纯展示，不调 `appendEntry`，不改任何消息。
 - **为吸顶行新增键位**：见 §4.5 与 §10。
-- **自己按组件累加渲染高度来算行区间**：走布局帧（§6 第 1 条），不做第二套。
+- **指望布局帧给出消息级行区间**：帧里没有这种 box（§2.2）。行区间以「自己按组件渲染高度累加」为唯一实现（§6 第 1 条）。
 - **改 Pi 本体或向上游提 PR**：上游虽未人工否决，但维护者建议做扩展、贡献指南也写明核心求小（§2.5）。
 - **与 `pi-affix-prompt` 共存**：两者都会改根布局 `entries`，同装会打架。本规格假定不装它。
 
@@ -126,6 +142,12 @@
 显示候选中的**最后一条**（离视口顶最近的那条）。随上滚越过更早的提问，它进入候选并成为最后一条，吸顶行随之换人。
 
 无候选 → 隐藏。
+
+**怎么找**（这是每帧的性能所在）：从内容第 0 块往前累加高度，**游标一越过 `scrollTop` 就停**——后面所有块起始行都更靠下，不可能再有 `end <= scrollTop` 的块。所以：
+
+- 越靠近底部走得越少；**跟随末尾时由 §4.1 提前挡掉，一块都不量**（那正是最贵的情形）。
+- 高度**每帧实测、不缓存**（理由见 §2.2），因此「非尾块长高」（展开工具输出、思考块显隐、资源区变化）**同一帧**就反映出来，不存在「等下一帧才修正」的窗口。
+- 一条提问摘不出内容（系统注入 / 空）时**继续往前找**，不是就此返回 null——否则一条注入消息就能把吸顶行整条压掉。
 
 ### 4.3 摘要怎么取
 
@@ -161,8 +183,10 @@
 - **entry 选项**：`{ component: 吸顶行, basis: "auto", grow: 0, shrink: 0, minSize: 0 }`。
 - **只动根布局自身**：`entries.splice` 重排时，transcript 与 dock 两个 entry **原样复用**（同一对象），绝不嵌套、不重组他人的 entry——别的扩展可能按 `root.entries` 找自己，嵌套会让它找不到。
 - **关闭即恢复**：关开关时把吸顶行 entry 移除，其余 entry 保持原有顺序与选项。
-- **探针（注入前）**：校验 ① 根布局形状符合预期（至少两项，且能按 `component.primary === true` 找到 transcript）；② 布局帧取得到且形状符合预期（§2.2 的两个深引函数存在、`getScrollViewBox` 能在帧里定位到那个 transcript）。任一不符 → **不注入**、不抛错，并 `notify(..., "warning")` 一次。
-- **每帧校验**：挂在吸顶行自己的 `render()` 里（那一段本来就每帧跑，滚动会触发 TUI 重渲染），**不引入任何订阅机制**——`ScrollView` 与 `TUI` 都没有 onScroll / onChange 这一类公开 API。结构被外力改变时按需修正，但不重复插入同一条。
+- **探针（注入前）**：三条全过才注入——① 根布局至少两项；② 能按 `component.primary === true` 找到 transcript；③ 内容容器可取且内容区段非空。**任一不符 → 不注入、不抛错，并 `notify(..., "warning")` 一次**（不重复刷屏）。三条都要查：只查 transcript 的话，「项数不足」会静默溜过去，用户什么提示都看不到。
+- **运行期结构异常上报**：`UserMessageComponent` 认出来了、但它的正文读不到（Pi 改了字段名）→ 按结构异常 `notify(..., "warning")` 一次，**不画空行**（空行看起来像「这条提问本来就是空的」）。这一条不走探针——探针在会话开始时就跑完了，那时还没有消息。
+- **每帧的活挂在吸顶行自己的 `render()` 里**：那一帧本来就跑，滚动会触发 TUI 重渲染，不需要 `ScrollView` / `TUI` 的 onScroll 之类**订阅**（它们也没有这种公开 API）。
+- **重新注入靠一条低频巡检**：根布局会在运行期被重建（比如用 `/settings` 切 tui-mode），重建后我们那条 entry 就没了；而**吸顶条一旦被摘掉就再也不会被渲染，自己发现不了**。所以插件侧每秒确认一次「还在不在」（只做几次数组查找，`unref` 过、不吊进程），不在位就按当前开关重新同步。
 - 全屏之外（regular 模式）直接跳过，不算探针失败（那是正常跳过，不报警）。
 
 ### 4.7 开关与持久化
@@ -189,7 +213,7 @@
 
 ## 6. 自定细节（作者确定，非用户逐项指定）
 
-1. **行区间取自 Pi 的布局帧**，而不是自己按组件渲染高度累加（§2.2）。理由：同源、零额外渲染、不必维护缓存失效。代价：要深引 `@earendil-works/pi-tui/dist/layout.js`（该包无 `exports` 字段，可深引，但它不在包根的公开导出清单里）。**不做「自己累加」的兜底**——探针拿不到帧就停用，避免两套代码。
+1. **行区间自己算，且高度不缓存、每帧实测**：从内容第 0 块往前 `render(contentWidth).length` 累加（`contentWidth` 走公开的 `getContentWidth(width)`），游标越过 `scrollTop` 就早退；`UserMessageComponent` 的块就是提问。**不用布局帧的任何东西**——既因为帧里没有消息级 box，也因为深引它会让整个扩展加载失败（两件事都在 §2.2）。代价是有界且可测的：只在离开底部时才走，且靠底部时只走几块（§4.2）；这笔账记在 §10，由 §7.2 的真机实测来判。**不做缓存**：缓存要正确就需要一个失效信号，而唯一候选（布局帧的内容总高）比当前帧晚一拍，会让「非尾块长高」时显示错的提问——见 §2.2 最后一行。
 2. **候选判据用精确的 `区间.end <= scrollTop`**，而不是照抄 CC 的 `itemTop + 1 >= scrollTop` 守卫。CC 那是对「项顶 +1」的近似；我们既然拿到的是精确区间，就用无歧义的「整条完全在其上」。
 3. **摘要不设固定字数上限**（CC 是 500 字）。终端宽度已是天然上限，再加字数限制只会让宽屏下显示更少。
 4. **点击跳转不留余量**：滚到该提问的起始行，顶部对齐视口顶。CC 留 1 行，是因为它的吸顶行本身占据视口第 0 行；我们跳转时吸顶行会消失，留余量反而多空一行。
@@ -200,10 +224,13 @@
 9. **摘要保留原文 markdown 标记**，只压平空白——不做 markdown 渲染。一行摘要里渲染 markdown 只会把 `**` 变成粗细变化，反而更难读。
 10. **设置落点 `~/.pi/agent/sticky-prompt.json`**，与 `pi-affix-prompt` 同目录同惯例。Pi 没有一等的扩展设置 API（`docs/settings.md` 只列内置项），扩展自管。**原子写**（`.tmp` + `rename`），读失败或内容损坏一律回落默认值。
 11. **开关默认「开」**：这是个低风险的展示功能，默认开才有人会发现它；不想要的人一条命令就关掉。
-12. **注入 entry 的选项固定为** `{ basis: "auto", grow: 0, shrink: 0, minSize: 0 }`；与参考实现一致（`/tmp/affix-probe/index.ts:414`）。`grow: 0` + `shrink: 0` 是关键——它保证吸顶行不会跟 transcript 抢空间。
+12. **注入 entry 的选项固定为** `{ basis: "auto", grow: 0, shrink: 0, minSize: 0 }`；与参考实现一致（`/tmp/affix-probe/index.ts:409`）。`grow: 0` + `shrink: 0` 是关键——它保证吸顶行不会跟 transcript 抢空间。
 13. **坐标系不在区间表里做 header 补偿**：整张表从内容第 0 行起算（§4.0），header 高度自然含在内。不额外引入一个「header 偏移量」的常量。
 14. **探针失败只告警一次**：用一个模块级标志位，避免每帧刷屏。
 15. **关闭时不 dispose 吸顶行组件**：保留实例，再打开时复用，避免重复构造；只在插件卸载时清理。
+16. **吸顶条组件上打一个跨实例标记**（`Symbol.for("pi-plugins.sticky-prompt.bar")`）：`/reload` 会换一个新组件实例，只靠实例身份认不出布局里残留的旧条子。摘除时**认两种**——实例身份**或**该标记；只认标记的话，万一标记没打上就会重复插入，而那个失败模式太安静。
+17. **状态文件路径可用环境变量覆盖**（`PI_STICKY_PROMPT_STATE`）：单测靠它指到临时目录，**绝不去读写使用者真实的 `~/.pi/agent/`**。不隔离的话，谁用 `/sticky-prompt` 关过一次，跑 `npm test` 就会有四条用例红。按调用时取值，不在模块加载时定死。
+18. **「哪个区段是聊天区」靠动态认，不靠固定下标**：`instanceof UserMessageComponent` 扫一遍内容容器的子区段，命中的那个摊到消息级，其余整块算。比按 `children[2]` 这种下标稳；代价是 Pi 若把聊天区再嵌深一层，会**静默没有吸顶行**——这也是 §4.6 探针只查「内容区段非空」而不查「找得到聊天区」留下的口子，记在 §10。
 
 ## 7. 验收标准
 
@@ -222,7 +249,13 @@
 - [ ] **显隐**：`isFollowingEnd` 为真时不显示；开关为关时不显示；探针失败时不显示。
 - [ ] **布局注入**：给定假 root，注入后 `entries[0]` 是吸顶行、其余 entry 是**同一对象引用**（不是复制、不是嵌套）。
 - [ ] **关闭恢复**：关开关后 `entries` 的组件顺序与选项回到注入前。
-- [ ] **结构不符**：root 项数不足 / 找不到 `primary === true` / 布局帧取不到时，不注入、不抛错、告警恰好一次。
+- [ ] **加载**：能被 Pi 的真实扩展加载器（`discoverAndLoadExtensions`）加载起来，**0 错误、1 个扩展**。这条守的是「整个扩展加载失败」那一类缺陷——本轮就抓到过一次（深引 `dist/layout.js`）。复现方式：把它加回去，加载数立刻变 0 并报 `Cannot find module`。
+- [ ] **探针不通过**：root 项数不足 / 找不到 `primary === true` / 内容区段为空，三个子例**各自**都要验到「不注入、不抛错、告警恰好一次」——只覆盖其中一个不算过。
+- [ ] **早退**：游标越过 `scrollTop` 之后**不再测量后面的块**（记录「被 measure 了哪几块」来断言，而不是只看结果对不对）。
+- [ ] **同帧实测**：候选**上方**的块长高后，同一个 `render()` 调用的结果就是对的（**不许**需要再来一帧）。这条是缓存设计的反回归护栏——把高度缓存加回去，它必须变红（本轮修订已做过一次变异验证：注入缓存后正是这条失败）。
+- [ ] **候选下方的块长高不改变答案**：尾部（流式）撑高时，已判定的那条与点击目标都不受影响。
+- [ ] **正文读不到**：`UserMessageComponent` 认得出但正文取不到时，上报一次（不重复刷屏），且**不画空行**。
+- [ ] **测试隔离**：所有会构造插件的用例都在临时状态文件下跑（`PI_STICKY_PROMPT_STATE`）。验收方式：把使用者的 `~/.pi/agent/sticky-prompt.json` 设成 `enabled:false` 时全量测试仍须全绿。
 - [ ] **幂等**：连续多帧调用不产生重复 entry。
 - [ ] **不嵌套他人 entry**：root 上有第三方 entry 时，注入与移除都不把它包进新容器。
 - [ ] **设置读写**：读不到 → 默认值（开）；内容损坏 → 默认值；写入走「临时文件 + rename」（断言无半截文件）。
@@ -248,12 +281,13 @@
 | 机制 | 解决什么 / 没有它会怎样 |
 |---|---|
 | 布局注入（往根布局 `entries` 前插一条） | 让「屏幕顶部常驻一行」成立。没有它，唯一可用的位置是编辑器上方，到不了 transcript 顶部。 |
-| 消息行区间表（`{start, end, comp}`，取自布局帧） | 让「哪条提问在第几行」可知，用于判断谁滚出去了、以及点击该滚到哪。没有它，判据和跳转目标都算不出来。 |
+| 行区间前向累加 + 早退（每帧实测，不缓存） | 让「哪条提问在第几行」可知，用于判断谁滚出去了、以及点击该滚到哪。没有它，判据和跳转目标都算不出来；不做早退就会在贴着底部时白量整条 transcript。 |
 | 吸顶判据 + 显隐 | 决定显示谁、何时消失。没有它，吸顶行会常亮不消，或该出现时不出现。 |
 | 点击跳转 | 你要的核心交互：点一下回到那条消息看全文。没有它，只能靠手动滚。 |
 | 摘要提取 | 把整条提问压成一行。没有它，长提问会撑爆吸顶行。 |
 | 开关 + 持久化 | 给用户一个关掉它的入口，且关掉的状态跨会话保留。没有它，行为不对时用户只能卸载插件。 |
-| 私有面探针 + 降级 | Pi 改布局结构时不静默画错：不注入 + 告警一次。没有它，升级后吸顶行会静默错位或报错，而且很难定位到是这个插件干的。 |
+| 私有面探针（硬前提三条）+ 正文缺失上报 | Pi 改布局结构时不静默画错：不注入 + 告警一次。没有它，升级后吸顶行会静默错位或报错，而且很难定位到是这个插件干的。 |
+| 低频重新注入巡检（1 秒） | 根布局在运行期被重建（切 tui-mode）后，我们那条 entry 会消失，而吸顶条被摘掉后就再也不会被渲染、自己发现不了。没有它，切一次模式就得重启 Pi 才能再看到吸顶行。 |
 
 ## 9. 改动边界
 
@@ -270,9 +304,15 @@
 
 ## 10. 待定与风险
 
-- **深引 `@earendil-works/pi-tui/dist/layout.js`（本规格最大的账）**：它不在包根公开导出清单里，只是因为这个包没有 `exports` 字段才引得到。Pi 一旦加上 `exports` 字段，这条通路立刻断。探针会挡住（不注入 + 告警），但那时功能就没了，要改回自己累加。
-- **其余私有面依赖**：`tui.layoutRoot` / `tui.currentLayout`（TS private，运行时可达）、`UserMessageComponent` 实例上的 `text`（TS private）。`ScrollView` 那边不用碰私有面——`scrollTop` / `isFollowingEnd` / `scrollTo` 全是公开 API。
-- **`text` 字段名依赖**：`user-message.d.ts:7` 是 `private text`，类型上读不到，只能运行时取。若 Pi 改名，摘要会取空——表现为「吸顶行出现但内容为空」；探针应把这种情形也当结构异常处理，而不是画一条空行。
+- **自己算高度、且不缓存的性能（本规格最大的账）**：每帧对「视口之上的每个内容块」取一次 `render(contentWidth).length`。不缓存是**有意的**（§2.2 最后一行讲清了为什么），代价是：
+  - 贴着底部时最贵（视口之上几乎全部内容）——但那种情形由 §4.1 提前挡掉，一块都不量；跟随末尾看输出时**零开销**。
+  - 离开底部后，代价随「往上滚的距离」增长。**这笔账只能实测**，所以 §7.2 有一条「≥ 50 条提问的长会话滚动流畅」。若实测发现卡，下一步是给缓存补一个**真正可靠**的失效信号（而不是退回那套「晚一帧的校验和」）。
+  - 与之对照：Pi 自己的布局每帧本来就会把整条内容渲染一遍（已知的性能痛点），我们做的是在「已离开底部」这个子集上再加一遍。
+- **不再依赖任何深引**：本轮修订把 `@earendil-works/pi-tui/dist/layout.js` 去掉了——不是因为「Pi 加 `exports` 就会断」，而是因为**它现在就会断**：扩展由 jiti 加载，非 bundle 形态走 alias（前缀替换）分支，`…/pi-tui/dist/layout.js` 会被拼成 `…/pi-tui/dist/index.js/dist/layout.js` → `Cannot find module`，而静态 `import` 没有 try/catch 可挂，**整个扩展加载失败**。所以「读不到就不做校验和」这种降级是不可能实现的——只能不用它（§2.2）。
+- **私有面依赖（收敛后只剩两处）**：`tui.layoutRoot`（TS private，运行时可达）；`UserMessageComponent` 实例上的 `text`（TS private）。`ScrollView` 那边**完全不碰私有面**——`scrollTop` / `isFollowingEnd` / `scrollTo` / `getContentWidth` 是公开方法，内容容器走公开的 `children`（§2.2）。**`tui.currentLayout` 也不再用了。**
+- **`text` 字段名依赖**：`user-message.d.ts:7` 是 `private text`，类型上读不到，只能运行时取。若 Pi 改名，那条提问会被跳过、并**按结构异常告警一次**（§4.6），不会画空行糊过去。
+- **失效传播断裂（已知、当前无实际影响）**：吸顶条是用 `entries.unshift` 进的 `Stack.entries`，**没进 `Stack.children`**；而 Pi 的 `invalidate()` 是沿 `children` 传播的（`tui.js:111-114`）。所以主题切换之类靠 `invalidate` 的失效通知**到不了吸顶条**。目前没有「主题影响行高」的组件，且高度本来每帧实测，所以还炸不了；但同一根因会让 `/debug` 的整屏转储少掉吸顶条那一行。真要修，得走 `setWidget` 那条路（进 `children`），代价是位置改到编辑器上方——那是另一种形态，需另开规格。
+- **聊天区靠动态识别，嵌深一层就会静默失效**：§6 第 18 条。探针只查「内容区段非空」，没查「找得到聊天区」，所以 Pi 若把聊天区再嵌深一层，表现是**静默没有吸顶行**（不报错、不告警）。这是探针目前留下的口子，实施时若要收紧，可以在探针里加一条「内容里能找到一个含 `UserMessageComponent` 的区段，或会话本来就是空的」——但那需要读会话，本规格刻意不读。
 - **键盘路径（未纳入）**：Pi 官方 TUI 文档要求每个交互都留键盘路径。本规格认为「滚上去就能看到全文」已在实质上满足该要求，故不为吸顶行新增键位；若你认为需要一个「一键跳回」的快捷键，那是**新机制**，需另开一份规格。
 - **视口少一行的观感**：吸顶行出现时 transcript 视口少一行（内容不跳，只是底部少露一行）。若实测觉得别扭，可改为覆盖式绘制（画在 transcript 第 0 行之上）——那是另一种机制，需另开规格。
 - **与其他改根布局的扩展冲突**：`pi-affix-prompt` 也改 `root.entries`，同装会互相踩。本规格只保证不主动破坏他人 entry，不保证与同类插件共存。
@@ -299,3 +339,47 @@
 | 13 | 低 | §5 对 CC 的描述有两处内部张力；CC 侧不可复核 | 已改：§5 开头声明单源不可复核；第 1 行拆开「主规则 / 次级守卫」；新增「是否恒一行」一行，明确「恒一行是本规格的选择、不是 CC 的行为」，并同步修文件头「用户确认」的表述 |
 
 **未采纳的发现**：无。
+
+### 2026-10-16 追加：实施期发现（用户点「改旧的」后修订）
+
+开工实施时发现：**上面 #2 的处置方向反了**——改成了「走布局帧、不必自己累加」，但布局帧根本给不出消息级行区间。这是本轮唯一一处「改错了又改回来」的记录，如实留着。
+
+- **错在哪**：布局帧只给 `Stack`（VStack/HStack）与 `ScrollView` 产生 box；四个 transcript 容器全是裸 `Container`，而 `Container` 不实现 `[LAYOUT_NODE]()`，其子树被拍平进父级 box 的 `lines`。所以消息这一层**没有 box**，`LayoutBox.children` / `lineOffset` 无从谈起。
+- **#2 的哪些部分仍然成立**：`getScrollViewBox` / `getLayoutBoxesAt` 确实可深引；`pi-tui/package.json` 确实没有 `exports` 字段。变的只是它们的**用途**——从「读行区间」改成「取校验和」。
+- **改了哪些落点**（同一份 spec，非新开；按 `spec-revision-sync` 的口径逐一同步）：
+  - §2.2 整节重写（结论反转）；
+  - §2 末的「来龙去脉」段改写（记下这一节被改过两次）；
+  - §3「不包含」里那条反向改写；
+  - §4.6 探针拆成**硬前提 / 软前提**两级（原来只有一级「不符就不注入」）；
+  - §6 第 1 条改为「自己算 + 帧校验和」；
+  - §7.1 验收把「结构不符」拆成硬前提与软前提两条，并新增「校验和自检」一条；
+  - §8 机制 2 的描述同步；
+  - §10 把「深引 layout.js」从「最大的账」降级为「坏了可退化」，并把「最大的账」改挂到新增的「自己算高度的性能」一条上。
+- **这次修订暴露的流程问题**（供以后参考）：轻审 #2 给出的是「这个 API 拿得到」，而处置时被写成了「所以不用自己算」——**从「拿得到」到「够用」中间隔着一层没验的假设**。以后遇到同类修订，落笔前应先确认那个 API 返回的东西是否真的覆盖需求，而不是只确认它存在。
+
+### 2026-10-16 再追加：实施期重审（2 路）后修订
+
+用户在闸卡上点「重审」，两路（规格符合性 / 对抗式找 bug）合计 20 条发现，**全部采纳**。这轮改动面最大——**把高度缓存整个去掉了**。原始发现清单见 PR #21 的两条评论。
+
+| # | 来源 | 发现 | 处置 |
+|---|---|---|---|
+| 1 | 规格符合性 | 「校验和自检」那条验收**断言恒真**：喂的数据根本没触发被测分支，把那段代码删掉测试照样绿 | 已改：该验收项连同缓存一起删除，换成新的「同帧实测」反回归项（见下 #3）。**这是本轮最该记的一条**——一个恒真的测试比没有测试更坏，它让人以为覆盖了 |
+| 2 | 规格符合性 | 探针只覆盖了「找不到 transcript」一个子例；「项数不足」静默不注入、不告警 | 已改：探针补齐三条硬前提，任一不符都告警一次；§7.1 要求三个子例**各自**验到 |
+| 3 | 对抗式 | 缓存有三条覆盖漏洞，会让吸顶条**显示错的提问、点击跳到错的行**，且用户停着不动时**一直错着**；`invalidate()` 在真实运行里根本没有调用者（吸顶条不在 `children` 里，收不到失效传播） | 已改：**去掉缓存**，改为每帧实测 + 前向早退。并用变异验证过护栏有效：临时把缓存加回去，「候选上方的块长高」那条测试立刻变红（35/36），还原后 36/36 |
+| 4 | 两路都报 | 深引 `dist/layout.js` 是静态 `import`：在 jiti 的 **alias 模式**（非 bundle 的 Node 构建）下整个扩展**加载失败**，spec 承诺的「降级为不做校验和」根本到不了 | 已改：**不再用布局帧的任何东西**（校验和随之消失）。§2.2 记下了实测结论与依据行号 |
+| 5 | 规格符合性 | 测试不隔离环境：多数用例会去读使用者真实的 `~/.pi/agent/sticky-prompt.json`，谁关过一次就会有四条用例红 | 已改：抽出 `withTempState()`，所有构造插件的用例都在临时状态文件下跑；并加了一条「使用者关着时全绿」的用例 |
+| 6 | 两路都报 | 软前提失败也报「吸顶行已停用」，而代码随后照常工作——假警报 | 已改：软前提这个概念随校验和一起消失，探针只剩一档；告警文案只有一种含义 |
+| 7 | 规格符合性 | §2.5 说两条 issue「维护者动作都只是没有重新打开」——对 #7802 **不成立**（badlogic 确实回复了） | 已改：拆成「#7802 维护者明确建议做成扩展；#8447 无人回应」 |
+| 8 | 规格符合性 | `entry 选项` 引 `/tmp/affix-probe/index.ts:414`，实际在 `:409`；`dispatchMouseToLayout` 引 `:636-650`，实际起于 `:634` | 已改：两处行号 |
+| 9 | 规格符合性 | 4 处**未申报的实现层决定**：跨实例标记、状态文件环境变量、校验和对账口径、靠 `instanceof` 动态认聊天区 | 已改：跨实例标记 → §6 第 16 条；环境变量 → §6 第 17 条；聊天区识别 → §6 第 18 条；校验和口径那条随缓存一起消失 |
+| 10 | 规格符合性 | 1 秒自愈巡检也是未申报的机制，且 `render()` 里**根本没有** §4.6 说的「每帧校验」 | 已改：§4.6 把两件事分开写清（每帧的活在 `render()`；重新注入靠巡检）；巡检进 §8 机制清单 |
+| 11 | 规格符合性 | §10 说 `text` 读不到要「当结构异常处理」，实现只做到不画空行 | 已改：实现补上一次性告警（`StickyBar` 接 `onAnomaly` 回调，接进插件侧的 `warn`）；§7.1 加验收项 |
+| 12 | 规格符合性 | README 两处与实现不符：「点击是唯一的新交互」（漏了 `/sticky-prompt` 命令）、探针「对不上就不启用」（旧的两级口径） | 已改：README 两处措辞同步 |
+| 13 | 规格符合性 | §3 说 regular 模式「不注册」，实现里 `registerCommand` 是无条件执行的；README 同句漏了 | 已改：三处口径统一为「不注入、不报错、不告警；命令仍会注册」 |
+| 14 | 规格符合性 | emoji 截断用例只有 CJK、没有 emoji；「纯展示」断言偏弱；「取色随主题」验不出懒取的意图 | 已改：emoji 用真 emoji；纯展示改用 Proxy 记录 `pi` 的成员访问并断言只碰了 `on` / `registerCommand`；取色改成同一个 bar 实例换主题再断言输出变化 |
+
+**两路明确排除的**（这些原本最没把握，现在有依据了）：**坐标原点**（实仓层级逐层核过，空 chat 与资源区自带 children 两种形状都正确）、**鼠标点击**（全屏下合成的是 `click`，路径核过）、**布局改写**（`entries` 就是引擎每帧读的那个数组，`unshift` 即时可见，关闭能逐字段还原）、**自愈巡检**（`/reload` 会 await shutdown，不会出现两个 interval 互插）。
+
+**补记：第 4 条已做成可复现的护栏。** 修订落地后，用 Pi 自己的 `discoverAndLoadExtensions` 跑了一次真实加载——**当前实现 1 个扩展、0 错误**；把深引临时加回去，立刻变成 **0 个扩展**并报 `Cannot find module '…/pi-tui/dist/index.js/dist/layout.js'`（正是审出来的那条路径）。这条已固化成 `layout.test.ts` 里的一个用例，并进了 §7.1 验收。
+
+**这轮的另一条流程教训**：第 4 条那种错误，「只确认 API 拿得到」是查不出来的——它要靠**真的把加载路径跑一遍**。同理第 3 条，靠读代码看不出「缓存失效会显示错提问」，是照着「用户会怎么用」（Ctrl+O 展开后停住不动）推出来的。以后这类交付物，审核 prompt 里要明确要求**给出可复现的操作序列**，而不只是「哪里可能有问题」。
