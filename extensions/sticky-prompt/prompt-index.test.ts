@@ -1,17 +1,34 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
-import { buildIndex, pickSticky, summarize, totalHeight, type ContentBlock } from "./prompt-index.ts";
+import { pickSticky, summarize, type StickySource } from "./prompt-index.ts";
 
-/** 只有高度、不是提问的块（assistant / 工具输出等）。 */
-function other(height: number): ContentBlock {
-	return { height, isPrompt: false, text: "" };
+/** 一块内容：高度 + 如果是用户提问就带正文。 */
+interface Block {
+	height: number;
+	prompt?: string;
 }
 
-/** 用户提问块。 */
-function prompt(height: number, text: string): ContentBlock {
-	return { height, isPrompt: true, text };
+/** 造一个块来源，并记下「到底测量了哪几块」——早退有没有生效全靠它验。 */
+function sourceOf(blocks: Block[]): { source: StickySource; measured: number[] } {
+	const measured: number[] = [];
+	return {
+		measured,
+		source: {
+			count: () => blocks.length,
+			measure: (index) => {
+				measured.push(index);
+				return blocks[index]?.height ?? 0;
+			},
+			describe: (index) => {
+				const block = blocks[index];
+				return { isPrompt: block?.prompt !== undefined, text: block?.prompt ?? "" };
+			},
+		},
+	};
 }
+
+const W = 200;
 
 // ---------------------------------------------------------------- 摘要提取
 
@@ -50,24 +67,24 @@ test("摘要过滤：< 出现在中间不受影响", () => {
 	assert.equal(summarize("用 <div> 包起来", 100), "用 <div> 包起来");
 });
 
-test("摘要截断：超宽补省略号，且可视宽度不超上限", () => {
-	const long = "一二三四五六七八九十".repeat(20);
-	const out = summarize(long, 20);
+test("摘要截断：CJK 宽字符超宽补省略号，可视宽度不超上限", () => {
+	const out = summarize("一二三四五六七八九十".repeat(20), 20);
 	assert.notEqual(out, null);
 	assert.ok(visibleWidth(out ?? "") <= 20, `实际宽度 ${visibleWidth(out ?? "")}`);
 	// truncateToWidth 会在省略号前后塞 ANSI 复位，所以要剥掉转义再断言。
 	assert.ok(stripTerminalSequences(out ?? "").endsWith("…"), `实际输出 ${JSON.stringify(out)}`);
 });
 
+test("摘要截断：emoji 按显示宽度算，不会被从中间劈开也不超宽", () => {
+	const out = summarize("🎉🎊🎈🎁🎂🍰🚀🛰️🌍🌏".repeat(6), 12) ?? "";
+	assert.ok(visibleWidth(out) <= 12, `实际宽度 ${visibleWidth(out)}`);
+	assert.ok(stripTerminalSequences(out).endsWith("…"));
+});
+
 test("摘要截断：纯 ASCII 超宽也补省略号", () => {
 	const out = summarize("a".repeat(200), 20) ?? "";
 	assert.ok(visibleWidth(out) <= 20);
 	assert.ok(stripTerminalSequences(out).endsWith("…"));
-});
-
-test("摘要截断：宽字符与 emoji 按显示宽度算，不按字符数", () => {
-	const out = summarize("宽宽宽宽宽宽宽宽宽宽", 7) ?? "";
-	assert.ok(visibleWidth(out) <= 7, `实际宽度 ${visibleWidth(out)}`);
 });
 
 test("摘要：宽度为 0 或负数 → null（没地方显示就不显示）", () => {
@@ -79,91 +96,111 @@ test("摘要：不超宽时原样返回，不加省略号", () => {
 	assert.equal(summarize("短", 10), "短");
 });
 
-// ---------------------------------------------------------------- 区间表
-
-test("区间表：只收提问块，行号按全部块累计", () => {
-	const blocks = [other(3), prompt(2, "A"), other(5), prompt(1, "B")];
-	assert.deepEqual(buildIndex(blocks), [
-		{ block: 1, start: 3, end: 5 },
-		{ block: 3, start: 10, end: 11 },
-	]);
-});
-
-test("区间表：高度为 0 的提问块不产生区间", () => {
-	assert.deepEqual(buildIndex([prompt(0, "空的"), other(2)]), []);
-});
-
-test("区间表：高度非法（负数 / NaN / 小数）被规整", () => {
-	assert.deepEqual(buildIndex([other(-5), prompt(2.9, "A"), other(Number.NaN)]), [{ block: 1, start: 0, end: 2 }]);
-});
-
-test("区间表：从内容第 0 行起算——header 高度进入行号，不会被漏掉", () => {
-	// 这块 other(7) 就是 header / 资源区。提问的 start 必须是 7，不是 0。
-	const blocks = [other(7), prompt(2, "提问")];
-	const intervals = buildIndex(blocks);
-	assert.equal(intervals[0]?.start, 7, "header 高度必须计入行号，否则整张表会偏一行");
-});
-
-test("totalHeight：逐块之和", () => {
-	assert.equal(totalHeight([other(3), prompt(2, "A"), other(5)]), 10);
-	assert.equal(totalHeight([other(-1), other(Number.NaN)]), 0);
-});
-
 // ---------------------------------------------------------------- 选谁
 
-const W = 200;
-
 test("选中：整条完全在视口顶之上的最后一条", () => {
-	const blocks = [other(2), prompt(3, "第一条"), other(4), prompt(3, "第二条")];
-	const intervals = buildIndex(blocks);
-	// intervals[0] = [2,5)  intervals[1] = [9,12)
+	// 行号：[0,2) 别块 | [2,5) 第一条 | [5,9) 别块 | [9,12) 第二条
+	const { source } = sourceOf([
+		{ height: 2 },
+		{ height: 3, prompt: "第一条" },
+		{ height: 4 },
+		{ height: 3, prompt: "第二条" },
+	]);
 
-	assert.equal(pickSticky(blocks, intervals, 0, W), null, "没滚过任何提问");
-	assert.equal(pickSticky(blocks, intervals, 4, W), null, "第一条还没整条滚出去");
-	assert.equal(pickSticky(blocks, intervals, 5, W)?.text, "第一条", "恰好 end === scrollTop 应入选");
-	assert.equal(pickSticky(blocks, intervals, 5, W)?.index, 0);
-	assert.equal(pickSticky(blocks, intervals, 8, W)?.text, "第一条", "第二条还没露头");
-	assert.equal(pickSticky(blocks, intervals, 12, W)?.text, "第二条");
-	assert.equal(pickSticky(blocks, intervals, 999, W)?.text, "第二条", "全滚出去了选最近那条");
+	assert.equal(pickSticky(source, 0, W), null, "没滚过任何提问");
+	assert.equal(pickSticky(source, 4, W), null, "第一条还没整条滚出去");
+	assert.equal(pickSticky(source, 5, W)?.text, "第一条", "恰好 end === scrollTop 应入选");
+	assert.equal(pickSticky(source, 8, W)?.text, "第一条", "第二条还没露头");
+	assert.equal(pickSticky(source, 12, W)?.text, "第二条");
+	assert.equal(pickSticky(source, 999, W)?.text, "第二条", "全滚出去了选最近那条");
 });
 
 test("选中：end === scrollTop + 1 不入选（差一行也不算滚出去）", () => {
-	const blocks = [other(0), prompt(3, "第一条"), other(4), prompt(3, "第二条")];
-	const intervals = buildIndex(blocks);
-	// intervals[0] = [0,3)  intervals[1] = [7,10)
-	assert.equal(pickSticky(blocks, intervals, 2, W), null);
-	assert.equal(pickSticky(blocks, intervals, 3, W)?.text, "第一条");
+	const { source } = sourceOf([{ height: 3, prompt: "第一条" }, { height: 4 }, { height: 3, prompt: "第二条" }]);
+	// 第一条 [0,3)，第二条 [7,10)
+	assert.equal(pickSticky(source, 2, W), null);
+	assert.equal(pickSticky(source, 3, W)?.text, "第一条");
+	assert.equal(pickSticky(source, 9, W)?.text, "第一条");
+	assert.equal(pickSticky(source, 10, W)?.text, "第二条");
 });
 
 test("选中：scrollTop 是小数时向下取整后再比", () => {
-	const blocks = [prompt(3, "第一条"), other(10)];
-	const intervals = buildIndex(blocks);
-	assert.equal(pickSticky(blocks, intervals, 2.9, W), null);
-	assert.equal(pickSticky(blocks, intervals, 3.5, W)?.text, "第一条");
+	const { source } = sourceOf([{ height: 3, prompt: "第一条" }, { height: 10 }]);
+	assert.equal(pickSticky(source, 2.9, W), null);
+	assert.equal(pickSticky(source, 3.5, W)?.text, "第一条");
 });
 
 test("选中：无候选 / 全候选两种极端", () => {
-	assert.equal(pickSticky([], [], 100, W), null);
-	const blocks = [prompt(2, "唯一一条"), other(50)];
-	assert.equal(pickSticky(blocks, buildIndex(blocks), 2, W)?.text, "唯一一条");
+	assert.equal(pickSticky(sourceOf([]).source, 100, W), null);
+	const { source } = sourceOf([{ height: 2, prompt: "唯一一条" }, { height: 50 }]);
+	assert.equal(pickSticky(source, 2, W)?.text, "唯一一条");
 });
 
-test("选中：摘要不可用的候选要跳过并继续往上找，不能就此返回 null", () => {
-	const blocks = [prompt(2, "真正该显示的"), other(1), prompt(2, "<system-reminder>注入"), other(10)];
-	const intervals = buildIndex(blocks);
+test("选中：摘要不可用的候选要跳过并继续往前找，不能就此返回 null", () => {
+	const { source } = sourceOf([
+		{ height: 2, prompt: "真正该显示的" },
+		{ height: 1 },
+		{ height: 2, prompt: "<system-reminder>注入" },
+		{ height: 10 },
+	]);
 	// 滚到最底：最近那条是「注入」，被过滤后应回退到「真正该显示的」
-	assert.equal(pickSticky(blocks, intervals, 15, W)?.text, "真正该显示的");
+	assert.equal(pickSticky(source, 15, W)?.text, "真正该显示的");
 });
 
 test("选中：所有候选都不可用时返回 null", () => {
-	const blocks = [prompt(2, "<注入>"), other(3), prompt(2, "   ")];
-	assert.equal(pickSticky(blocks, buildIndex(blocks), 100, W), null);
+	const { source } = sourceOf([{ height: 2, prompt: "<注入>" }, { height: 3 }, { height: 2, prompt: "   " }]);
+	assert.equal(pickSticky(source, 100, W), null);
 });
 
-test("选中：返回的 interval 能定位到点击跳转的目标行", () => {
-	const blocks = [other(4), prompt(3, "目标"), other(9)];
-	const picked = pickSticky(blocks, buildIndex(blocks), 7, W);
-	assert.equal(picked?.interval.start, 4);
-	assert.equal(picked?.interval.end, 7);
-	assert.equal(picked?.interval.block, 1);
+test("选中：返回的 start 能直接当点击跳转的目标行", () => {
+	const { source } = sourceOf([{ height: 4 }, { height: 3, prompt: "目标" }, { height: 9 }]);
+	const picked = pickSticky(source, 7, W);
+	assert.equal(picked?.start, 4);
+	assert.equal(picked?.end, 7);
+	assert.equal(picked?.index, 1);
+});
+
+test("选中：高度非法（负数 / NaN / 小数）被规整，不会把行号算歪", () => {
+	const { source } = sourceOf([
+		{ height: -5 },
+		{ height: Number.NaN },
+		{ height: 2.9, prompt: "A" },
+		{ height: 1 },
+	]);
+	const picked = pickSticky(source, 3, W);
+	assert.equal(picked?.start, 0, "负数与 NaN 都按 0 算，小数截断");
+	assert.equal(picked?.end, 2);
+});
+
+// ---------------------------------------------------------------- 坐标与早退
+
+test("坐标：header 高度计入行号——不会整体偏一行", () => {
+	// 头两块（高度 5）就是 header / 资源区。提问在 [5,8)。
+	const { source } = sourceOf([{ height: 5 }, { height: 3, prompt: "目标提问" }]);
+	assert.equal(pickSticky(source, 4, W), null, "忘了算 header 高度就会在这里漏出来");
+	assert.equal(pickSticky(source, 8, W)?.start, 5, "点击要跳的那一行也必须是 5");
+});
+
+test("早退：游标一越过视口顶就不再测量后面的块", () => {
+	const { source, measured } = sourceOf([
+		{ height: 2 },
+		{ height: 3, prompt: "目标" },
+		{ height: 40 },
+		{ height: 40 },
+		{ height: 40 },
+	]);
+	pickSticky(source, 5, W);
+	assert.deepEqual(measured, [0, 1, 2], "越过 scrollTop=5 后就该停在第 2 块，不该去量后面三块");
+});
+
+test("早退：滚到很靠上时只量到提问本身", () => {
+	const { source, measured } = sourceOf([{ height: 3, prompt: "目标" }, { height: 40 }, { height: 40 }]);
+	pickSticky(source, 3, W);
+	assert.deepEqual(measured, [0, 1]);
+});
+
+test("早退：没有候选时也会走完（不许因为找不到就提前放弃）", () => {
+	const { source, measured } = sourceOf([{ height: 1 }, { height: 1 }, { height: 1 }]);
+	assert.equal(pickSticky(source, 100, W), null);
+	assert.deepEqual(measured, [0, 1, 2], "scrollTop 比总高还大时应当量完全部");
 });

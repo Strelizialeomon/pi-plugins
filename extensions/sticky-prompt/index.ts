@@ -198,14 +198,13 @@ export default function (pi: ExtensionAPI) {
 		if (tui.mode !== "fullscreen") return;
 
 		const check = probe(tui);
-		if (!check.hard) {
+		if (!check.ok) {
 			warn(check.reason ?? "布局结构不符");
 			return;
 		}
-		// 软前提不满足只是降级：不做校验和，功能照旧（spec §4.6）。
-		if (!check.checksum) warn(check.reason ?? "校验和不可用");
 
-		bar = new StickyBar(tui, () => ctx.ui.theme);
+		// 正文读不到（Pi 改了字段名）时按结构异常报一次，而不是画一条空行糊过去。
+		bar = new StickyBar(tui, () => ctx.ui.theme, (reason) => warn(reason));
 		(bar as BarComponent)[BAR_MARK] = true;
 		if (apply()) requestRender();
 		startHeal();

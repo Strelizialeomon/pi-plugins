@@ -3,67 +3,39 @@
  *
  * 坐标约定（spec §4.0）：所有行号都是 ScrollView **滚动内容的绝对行号**，
  * 第 0 行是内容容器的首行（header），不是第一条聊天消息。
- * 区间表也从第 0 行起算，所以 header 的高度天然含在内——不要另外补偏移量。
+ * 区间从第 0 行起算，所以 header 的高度天然含在内——不要另外补偏移量。
  */
 
 import { truncateToWidth } from "@earendil-works/pi-tui";
 
-/** 一个内容块：渲染后的行数 + 是不是用户提问 + 提问正文（仅 isPrompt 时有效）。 */
-export interface ContentBlock {
-	height: number;
-	isPrompt: boolean;
-	text: string;
-}
-
-/**
- * 一条用户提问占的内容行区间 `[start, end)`。
- * `block` 是它在 blocks 里的下标，调用方靠它取回组件。
- */
-export interface PromptInterval {
-	block: number;
-	start: number;
-	end: number;
-}
-
-/** 选中结果。 */
+/** 选中的那条。 */
 export interface StickySelection {
-	/** 在 intervals 里的下标 */
+	/** 选中的块下标，调用方靠它取回组件 */
 	index: number;
-	interval: PromptInterval;
+	/** 该块起始内容行（含） */
+	start: number;
+	/** 该块结束内容行（不含） */
+	end: number;
 	/** 压成一行、已按宽度截断的摘要 */
 	text: string;
 }
 
+/**
+ * 内容块来源。故意做成「问一次答一次」而不是先给一张表：
+ * 高度必须**每帧实测**（见 sticky-bar.ts 文件头「为什么没有缓存」），
+ * 而且早退要在测量之前就生效，所以只能按需去问。
+ */
+export interface StickySource {
+	/** 内容块总数 */
+	count(): number;
+	/** 第 index 块渲染后的行数 */
+	measure(index: number): number;
+	/** 第 index 块是不是用户提问，以及它的正文（不是提问时正文无意义） */
+	describe(index: number): { isPrompt: boolean; text: string };
+}
+
 function normalizeHeight(height: number): number {
 	return Number.isFinite(height) && height > 0 ? Math.trunc(height) : 0;
-}
-
-/**
- * 逐块累加高度，得出每条用户提问的行区间。
- * 高度为 0 的块不产生区间（它占不了行，也就谈不上「滚出视口」）。
- */
-export function buildIndex(blocks: readonly ContentBlock[]): PromptInterval[] {
-	const intervals: PromptInterval[] = [];
-	let cursor = 0;
-	for (let index = 0; index < blocks.length; index++) {
-		const block = blocks[index];
-		if (block === undefined) continue;
-		const height = normalizeHeight(block.height);
-		if (block.isPrompt && height > 0) {
-			intervals.push({ block: index, start: cursor, end: cursor + height });
-		}
-		cursor += height;
-	}
-	return intervals;
-}
-
-/** 所有块的高度之和。用来跟布局帧报的内容高度对账，验自己有没有算歪。 */
-export function totalHeight(blocks: readonly ContentBlock[]): number {
-	let sum = 0;
-	for (const block of blocks) {
-		if (block !== undefined) sum += normalizeHeight(block.height);
-	}
-	return sum;
 }
 
 /**
@@ -73,7 +45,7 @@ export function totalHeight(blocks: readonly ContentBlock[]): number {
  */
 export function summarize(text: string, width: number): string | null {
 	if (!Number.isFinite(width) || width <= 0) return null;
-	// 第一段 = 首个「空行」之前的部分。行内只有空格/制表不算空行。
+	// 第一段 = 首个「空行」之前的部分。只含空格/制表的行也算空行。
 	const firstParagraph = text.trim().split(/\n[^\S\n]*\n/)[0] ?? "";
 	const flat = firstParagraph.replace(/\s+/g, " ").trim();
 	if (flat === "" || flat.startsWith("<")) return null;
@@ -81,29 +53,34 @@ export function summarize(text: string, width: number): string | null {
 }
 
 /**
- * 选吸顶那一条：从最近的一条往远找，第一条同时满足
- * ① 整条完全在视口顶之上（`end <= scrollTop`）
- * ② 摘要有内容（`summarize` 不返回 null）
- * 的提问中选。
+ * 选吸顶那条：从内容第 0 行往前累加，取**最后一个**「整条完全在视口顶之上」
+ * （`end <= scrollTop`）且「摘要有内容」的提问。
  *
- * 顺序很重要：②不满足时要**继续往上找**，而不是就此返回 null——
- * 否则一条系统注入的消息就能把吸顶行整条压掉。
+ * 两个要点：
+ *
+ * ① **早退**：游标一旦越过 `scrollTop`，后面所有块的起始行都更靠下，不可能再有
+ *    `end <= scrollTop` 的块，立刻停。越靠底部走得越少；跟随末尾的情形由调用方
+ *    在进来之前就挡掉了。
+ *
+ * ② **不被不可用的候选截断**：一条提问摘不出内容（系统注入 / 空）时要**继续往前找**，
+ *    而不是就此返回 null——否则一条注入消息就能把吸顶行整条压掉。
+ *    所以一路记「最后一个可用的候选」，而不是遇到第一个就返回。
  */
-export function pickSticky(
-	blocks: readonly ContentBlock[],
-	intervals: readonly PromptInterval[],
-	scrollTop: number,
-	width: number,
-): StickySelection | null {
-	// scrollTop 是内容坐标，可能是小数（滚动补偿会带小数），取整后再比。
-	const at = Math.max(0, Math.floor(scrollTop));
-	for (let index = intervals.length - 1; index >= 0; index--) {
-		const interval = intervals[index];
-		if (interval === undefined || interval.end > at) continue;
-		const block = blocks[interval.block];
-		const text = summarize(block?.text ?? "", width);
-		if (text === null) continue;
-		return { index, interval, text };
+export function pickSticky(source: StickySource, scrollTop: number, width: number): StickySelection | null {
+	const at = Math.max(0, Number.isFinite(scrollTop) ? Math.floor(scrollTop) : 0);
+	const total = Math.max(0, Math.trunc(source.count()));
+	let cursor = 0;
+	let best: StickySelection | null = null;
+
+	for (let index = 0; index < total; index++) {
+		const start = cursor;
+		cursor += normalizeHeight(source.measure(index));
+		const { isPrompt, text } = source.describe(index);
+		if (isPrompt && cursor <= at) {
+			const summary = summarize(text, width);
+			if (summary !== null) best = { index, start, end: cursor, text: summary };
+		}
+		if (cursor > at) break; // ① 早退
 	}
-	return null;
+	return best;
 }
