@@ -171,6 +171,34 @@ subagent(run_in_background: true)  → 派 reviewer；完成后运行时自动�
 - **同装 `pi-affix-prompt` 会打架**：两者都要改根布局的 entry 顺序。本插件只保证不主动破坏别人的 entry，不保证与同类插件共存。
 - **它的开销随「往上滚的距离」增长**：吸顶行每帧都要实测「视口之上」那些内容块的高度（不缓存，否则会显示错的提问）。贴在最底部看输出时**零开销**——那种情形根本不计算。若你在很长的会话里往上翻觉得卡，那正是要测的地方。
 
+## 内置插件：dsh-scroll-speed
+
+`extensions/dsh-scroll-speed/` 不是 Pi 界面插件，而是一个**安装器 + 状态面板**：把
+[dsh-TUI](https://github.com/ccch1mneyyy/dsh-TUI) 的滚轮从上游硬编码 `±3` 行换成
+「慢滚 1 行/刻度、快滚按手势密度加速」的意图模型，并在 dsh-tui 升级覆盖后自动补回。
+
+背景与实测（为什么之前的调参都没用、Claude Code 的三层模型、PTY 探针数据）在
+[`docs/specs/2026-10-17-dsh-scroll-speed.md`](docs/specs/2026-10-17-dsh-scroll-speed.md)；
+用法和参数在 [`extensions/dsh-scroll-speed/README.md`](extensions/dsh-scroll-speed/README.md)。
+
+### 启用
+
+```bash
+pi install ~/code/pi-plugins
+/dsh-scroll apply     # 装补丁文件并打到当前 dsh-tui profile
+/dsh-scroll hook      # 挂 ~/.zshrc，dsh-tui 升级后启动前自动重打
+```
+
+`/dsh-scroll status` 查状态，`/dsh-scroll revert` 还原原厂。
+
+### 要知道的几条约定
+
+- **改的是 `~/.dsh/profiles/dsh-tui/...` 里的 profile 副本**，不是全局 npm 包——全局包只是启动器，
+  改它不会生效（这是上一轮调参全部失效的原因）。
+- **参数在 `~/.dsh/patches/scroll-speed/scroll-wheel-speed.js`**，环境变量 `DSH_TUI_SCROLL_SLOW` /
+  `DSH_TUI_SCROLL_FAST` / `DSH_TUI_SCROLL_ACCEL` 可覆盖；改模板后下次启动自动同步。
+- **上游改结构时不硬改**：匹配不到 wheel 分支就提示一次并保持原厂，不会把 dsh 弄坏。
+
 ## 发布（可选）
 
 `package.json` 里现在有 `"private": true` 防手滑。要发 npm 时去掉它，并保留 `pi-package` 关键字，才能进 [Pi package gallery](https://pi.dev/packages)。
